@@ -5,7 +5,7 @@ const PrivacyPolicy = ({ onBack }) => {
   const lastUpdated = "July 8, 2025";
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-blue-50/30 to-purple-50/20 flex flex-col">
+    <div className="h-screen bg-gradient-to-br from-gray-50 via-blue-50/30 to-purple-50/20 flex flex-col">
       {/* Header */}
       <div className="bg-white/95 backdrop-blur-md shadow-lg border-b border-gray-200/50 flex-shrink-0 relative">
         <div className="absolute inset-0 bg-gradient-to-br from-blue-50/30 via-white to-purple-50/20 pointer-events-none"></div>
@@ -33,8 +33,9 @@ const PrivacyPolicy = ({ onBack }) => {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-4 py-6 max-w-4xl mx-auto w-full">
-        <div className="bg-white rounded-2xl shadow-sm p-6 space-y-8">
+      <div className="flex-1 overflow-y-auto" style={{ height: 'calc(100vh - 120px)' }}>
+        <div className="px-4 py-6 max-w-4xl mx-auto w-full">
+          <div className="bg-white rounded-2xl shadow-sm p-6 space-y-8 mb-8">
           
           {/* Last Updated */}
           <div className="flex items-center space-x-2 text-sm text-gray-600 bg-blue-50 p-3 rounded-lg">
@@ -235,7 +236,7 @@ const PrivacyPolicy = ({ onBack }) => {
                 <strong>If you have any questions about this Privacy Policy, feel free to contact us:</strong>
               </p>
               <div className="space-y-2 text-gray-700">
-                <p><strong>Email:</strong> privacy@mymedalert.app</p>
+                <p><strong>Email:</strong> balivishnu.cs@gmail.com</p>
                 <p><strong>App Support:</strong> Use the feedback option within the app</p>
                 <p><strong>Response Time:</strong> We aim to respond to privacy inquiries within 48 hours</p>
               </div>
@@ -266,6 +267,7 @@ const PrivacyPolicy = ({ onBack }) => {
             </p>
           </div>
 
+          </div>
         </div>
       </div>
     </div>
