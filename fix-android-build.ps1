@@ -31,7 +31,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Web build failed"
     }
-} catch {
+}
+catch {
     Write-Host "❌ Web build failed: $_" -ForegroundColor Red
     exit 1
 }
@@ -43,7 +44,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Capacitor sync failed"
     }
-} catch {
+}
+catch {
     Write-Host "❌ Capacitor sync failed: $_" -ForegroundColor Red
     exit 1
 }
@@ -65,24 +67,26 @@ try {
     Write-Host "✅ Android build successful!" -ForegroundColor Green
     Write-Host "📱 APK location: android\app\build\outputs\apk\debug\app-debug.apk" -ForegroundColor Cyan
     
-    } catch {
-        Write-Host "❌ Android build failed: $_" -ForegroundColor Red
-        Write-Host "🔧 Trying alternative approach..." -ForegroundColor Yellow
+}
+catch {
+    Write-Host "❌ Android build failed: $_" -ForegroundColor Red
+    Write-Host "🔧 Trying alternative approach..." -ForegroundColor Yellow
         
-        # Try using Capacitor run instead
-        Set-Location ..
-        try {
-            npx cap run android --no-sync
-            Write-Host "✅ Capacitor run successful!" -ForegroundColor Green
-        } catch {
-            Write-Host "❌ All build attempts failed" -ForegroundColor Red
-            Write-Host "💡 Try opening the project in Android Studio manually:" -ForegroundColor Yellow
-            Write-Host "   1. Open Android Studio" -ForegroundColor White
-            Write-Host "   2. Open the android folder as a project" -ForegroundColor White
-            Write-Host "   3. Let Android Studio sync and build" -ForegroundColor White
-            Write-Host "   4. Run the app from Android Studio" -ForegroundColor White
-        }
+    # Try using Capacitor run instead
+    Set-Location ..
+    try {
+        npx cap run android --no-sync
+        Write-Host "✅ Capacitor run successful!" -ForegroundColor Green
     }
+    catch {
+        Write-Host "❌ All build attempts failed" -ForegroundColor Red
+        Write-Host "💡 Try opening the project in Android Studio manually:" -ForegroundColor Yellow
+        Write-Host "   1. Open Android Studio" -ForegroundColor White
+        Write-Host "   2. Open the android folder as a project" -ForegroundColor White
+        Write-Host "   3. Let Android Studio sync and build" -ForegroundColor White
+        Write-Host "   4. Run the app from Android Studio" -ForegroundColor White
+    }
+}
 
 Write-Host "🎯 Build process completed!" -ForegroundColor Green
 Read-Host "Press Enter to exit..."
