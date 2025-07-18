@@ -1,0 +1,46 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Hide scrollbar for Chrome, Safari and Opera */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+/* Hide scrollbar for IE, Edge and Firefox */
+.scrollbar-hide {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;  /* Firefox */
+}
+
+/* Use only atomic Tailwind classes with @apply */
+body {
+  @apply min-h-screen;
+}
+
+#root {
+  @apply min-h-screen;
+}
+
+#root > div, .modern-card {
+  @apply bg-white backdrop-blur-md rounded-b-2xl shadow-2xl max-w-lg w-full mx-auto min-h-screen;
+}
+
+h1, h2, h3 {
+  @apply font-bold;
+}
+
+button {
+  @apply rounded-lg px-6 py-2 font-semibold text-white shadow-lg transition-all duration-200 border-0;
+}
+
+input, select, textarea {
+  @apply rounded-lg border-2 border-fuchsia-300 focus:border-blue-400 focus:ring-2 focus:ring-blue-200 px-4 py-2 mb-2 w-full transition-all duration-200 bg-white ;
+}
+
+a {
+  @apply text-blue-600 hover:text-fuchsia-500 font-semibold transition-colors;
+}
+
+/* For vibrant backgrounds and gradients, use Tailwind classes directly in your JSX, e.g.:
+<div className="bg-gradient-to-tr from-blue-500 via-fuchsia-500 to-yellow-400 ..."> */
