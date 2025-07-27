@@ -201,17 +201,17 @@ const MedicineReminderApp = () => {
     localStorage.setItem(STORAGE_KEYS.emergencyContacts, JSON.stringify(emergencyContacts));
   }, [emergencyContacts]);
 
-  // Reschedule notifications when medicines are loaded
+  // Reschedule notifications when medicines are loaded (only once per session)
   useEffect(() => {
     if (medicines.length > 0) {
       // Small delay to ensure notification system is initialized
       const timer = setTimeout(() => {
         rescheduleAllNotifications();
-      }, 1000);
+      }, 2000); // Increased delay to 2 seconds
 
       return () => clearTimeout(timer);
     }
-  }, [medicines.length > 0]); // Only trigger when medicines are first loaded
+  }, [medicines.length === 0 ? false : true]); // Only trigger when medicines change from empty to having items
 
   // Generate notifications based on medicine schedule
   useEffect(() => {
@@ -299,7 +299,7 @@ const MedicineReminderApp = () => {
         return;
       }
 
-      console.log('Scheduling notification for:', medicine.name, 'at', medicine.alertTime);
+      console.log('📋 Scheduling notification for:', medicine.name, 'at', medicine.alertTime, 'type:', medicine.alertType);
 
       // Check if we're in a native app environment
       if (typeof window !== 'undefined' && !window.Capacitor) {
@@ -338,7 +338,7 @@ const MedicineReminderApp = () => {
         return;
       }
 
-      // Cancel any existing notifications for this medicine
+      // Cancel any existing notifications for this medicine first
       try {
         const notificationIds = [];
         for (let day = 0; day < 7; day++) {
@@ -347,6 +347,7 @@ const MedicineReminderApp = () => {
         await LocalNotifications.cancel({
           notifications: notificationIds
         });
+        console.log(`🚫 Cancelled existing notifications for ${medicine.name}`);
       } catch (error) {
         console.log('No existing notifications to cancel for', medicine.name);
       }
@@ -508,16 +509,36 @@ const MedicineReminderApp = () => {
   // Helper to reschedule all notifications (useful on app restart)
   const rescheduleAllNotifications = async () => {
     try {
-      // Clear all existing notifications
+      console.log('🔄 Rescheduling all notifications...');
+      
+      // Clear all existing notifications (both delivered and pending)
       await LocalNotifications.removeAllDeliveredNotifications();
+      
+      // Cancel all pending notifications
+      const pending = await LocalNotifications.getPending();
+      if (pending.notifications && pending.notifications.length > 0) {
+        await LocalNotifications.cancel({
+          notifications: pending.notifications.map(n => ({ id: n.id }))
+        });
+        console.log(`🚫 Cancelled ${pending.notifications.length} pending notifications`);
+      }
 
-      // Reschedule for all medicines
+      // Cancel all native alarms for existing medicines
       for (const medicine of medicines) {
+        if (medicine.alertType === 'native-alarm') {
+          await cancelNativeAlarm(medicine.id);
+        }
+      }
+
+      // Reschedule for all medicines with a small delay to avoid conflicts
+      for (const medicine of medicines) {
+        await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay between each
         await scheduleLocalNotification(medicine);
       }
-      console.log('All notifications rescheduled');
+      
+      console.log(`✅ All notifications rescheduled for ${medicines.length} medicines`);
     } catch (error) {
-      console.error('Error rescheduling notifications:', error);
+      console.error('❌ Error rescheduling notifications:', error);
     }
   };
 
@@ -937,6 +958,18 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
       if (window.Capacitor && window.Capacitor.isNativePlatform()) {
         console.log('🚨 Scheduling NATIVE alarms for:', medicine.name, `(${scheduleForDays} days)`);
 
+        // Enhanced debugging: Log the medicine details to understand the issue
+        console.log('📋 Medicine details:', {
+          name: medicine.name,
+          alertTime: medicine.alertTime,
+          alertType: medicine.alertType,
+          specificTime: medicine.specificTime,
+          patientName: medicine.patientName,
+          id: medicine.id,
+          currentTime: new Date().toLocaleString(),
+          isTestMedicine: medicine.name.toLowerCase().includes('test')
+        });
+
         const [hours, minutes] = medicine.alertTime.split(':');
         const results = [];
 
@@ -947,17 +980,25 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
           alarmTime.setDate(alarmTime.getDate() + day);
           alarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
 
-          // For day 0, check if time has passed - allow a small buffer for test medicines
+          // For day 0, check if time has passed - allow a generous buffer for manually created medicines
           const timeDiffMinutes = (alarmTime.getTime() - now.getTime()) / (1000 * 60);
+
+          // Enhanced logic: For manually created medicines, allow more flexible scheduling
+          // If the time is in the past but less than 5 minutes ago, schedule for today
+          // If it's further in the past, skip to tomorrow
+          const bufferMinutes = timeDiffMinutes < 0 ? -5 : -1; // 5 minute past buffer, 1 minute future buffer
+
           console.log(`🕒 Time comparison (Day ${day}):`, {
             alarmTime: alarmTime.toLocaleString(),
             currentTime: now.toLocaleString(),
             timeDiffMinutes: Math.round(timeDiffMinutes * 100) / 100,
-            willSchedule: !(day === 0 && timeDiffMinutes < -1)
+            bufferMinutes: bufferMinutes,
+            willSchedule: !(day === 0 && timeDiffMinutes < bufferMinutes),
+            medicineType: medicine.name.includes('Test') ? 'Test Medicine' : 'Manual Medicine'
           });
 
-          if (day === 0 && timeDiffMinutes < -1) { // Allow 1 minute buffer
-            console.log(`⏰ Time has passed today (${Math.round(timeDiffMinutes)} minutes ago), skipping day 0`);
+          if (day === 0 && timeDiffMinutes < bufferMinutes) {
+            console.log(`⏰ Time has passed today (${Math.round(timeDiffMinutes)} minutes ago), skipping day 0 - will start from tomorrow`);
             continue;
           }
 
@@ -977,6 +1018,11 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
           });
 
           try {
+            // Safety check: Ensure the native plugin is available
+            if (!window.Capacitor.Plugins || !window.Capacitor.Plugins.MedicineAlarm) {
+              throw new Error('MedicineAlarm plugin not available - native alarms disabled');
+            }
+
             // Call our custom native plugin for each day
             const result = await window.Capacitor.Plugins.MedicineAlarm.scheduleAlarm({
               medicineName: medicine.name,
@@ -987,17 +1033,36 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
             });
 
             console.log(`✅ Native alarm scheduled successfully for day ${day}:`, result);
-            results.push({ day, result, triggerTime: new Date(triggerTime).toLocaleString() });
+            results.push({ day, result, triggerTime: new Date(triggerTime).toLocaleString(), success: true });
           } catch (dayError) {
             console.error(`❌ Failed to schedule native alarm for day ${day}:`, dayError);
-            results.push({ day, error: dayError.message });
+            results.push({ day, error: dayError.message, success: false });
           }
         }
 
         // Show confirmation for debugging
         if (results.length > 0) {
-          console.log(`🎯 NATIVE ALARMS CONFIRMED: ${medicine.name} scheduled for ${results.length} days`);
-          console.log('📅 Scheduled times:', results.map(r => r.triggerTime).join(', '));
+          const successfulSchedules = results.filter(r => r.success);
+          const failedSchedules = results.filter(r => !r.success);
+
+          console.log(`🎯 NATIVE ALARMS SUMMARY for ${medicine.name}:`);
+          console.log(`   ✅ Successfully scheduled: ${successfulSchedules.length} alarms`);
+          console.log(`   ❌ Failed to schedule: ${failedSchedules.length} alarms`);
+
+          if (successfulSchedules.length > 0) {
+            console.log('📅 Successful scheduled times:', successfulSchedules.map(r => r.triggerTime).join(', '));
+          }
+
+          if (failedSchedules.length > 0) {
+            console.log('❌ Failed schedules:', failedSchedules.map(r => `Day ${r.day}: ${r.error}`).join(', '));
+          }
+
+          // Alert user if no alarms were successfully scheduled
+          if (successfulSchedules.length === 0) {
+            console.warn('⚠️ WARNING: No native alarms were successfully scheduled!');
+          }
+        } else {
+          console.warn('⚠️ WARNING: No native alarm scheduling attempts were made!');
         }
 
         return results;
@@ -3403,14 +3468,6 @@ Try the diagnostic button below to see your current settings.`);
               ))}
 
               <div className="flex flex-col space-y-3 pt-4">
-                {/* Test Notification Button for debugging */}
-                <button
-                  onClick={testNotification}
-                  className="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm"
-                >
-                  🧪 Test Notifications (Android Debug)
-                </button>
-
                 <div className="flex justify-between">
                   <button
                     onClick={() => setShowEmergencySettings(false)}
