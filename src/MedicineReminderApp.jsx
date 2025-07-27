@@ -510,10 +510,10 @@ const MedicineReminderApp = () => {
   const rescheduleAllNotifications = async () => {
     try {
       console.log('🔄 Rescheduling all notifications...');
-      
+
       // Clear all existing notifications (both delivered and pending)
       await LocalNotifications.removeAllDeliveredNotifications();
-      
+
       // Cancel all pending notifications
       const pending = await LocalNotifications.getPending();
       if (pending.notifications && pending.notifications.length > 0) {
@@ -535,7 +535,7 @@ const MedicineReminderApp = () => {
         await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay between each
         await scheduleLocalNotification(medicine);
       }
-      
+
       console.log(`✅ All notifications rescheduled for ${medicines.length} medicines`);
     } catch (error) {
       console.error('❌ Error rescheduling notifications:', error);
@@ -2035,30 +2035,44 @@ Try the diagnostic button below to see your current settings.`);
 
   // Emergency Functions
   const handleEmergencyCall = (contactIndex, callType = 'phone') => {
-    const contact = emergencyContacts[contactIndex];
-    if (contact && contact.phone && contact.name) {
-      if (callType === 'whatsapp') {
-        // WhatsApp call
-        const confirmed = window.confirm(
-          `Call ${contact.name} via WhatsApp?\n\nThis will open WhatsApp to call ${contact.phone}.`
-        );
-        if (confirmed) {
-          // WhatsApp call URL format
-          const cleanPhone = contact.phone.replace(/[^\d+]/g, ''); // Remove formatting
-          window.open(`https://wa.me/${cleanPhone}?text=Emergency!%20Need%20immediate%20assistance.`, '_blank');
+    try {
+      console.log('🚨 Emergency call triggered:', { contactIndex, callType, emergencyContacts });
+      
+      const contact = emergencyContacts[contactIndex];
+      console.log('📞 Contact details:', contact);
+      
+      if (contact && contact.phone && contact.name && contact.phone.trim() && contact.name.trim()) {
+        console.log('✅ Contact configured, proceeding with call');
+        
+        if (callType === 'whatsapp') {
+          // WhatsApp call
+          const confirmed = window.confirm(
+            `Call ${contact.name} via WhatsApp?\n\nThis will open WhatsApp to call ${contact.phone}.`
+          );
+          if (confirmed) {
+            // WhatsApp call URL format
+            const cleanPhone = contact.phone.replace(/[^\d+]/g, ''); // Remove formatting
+            window.open(`https://wa.me/${cleanPhone}?text=Emergency!%20Need%20immediate%20assistance.`, '_blank');
+          }
+        } else {
+          // Regular phone call
+          const confirmed = window.confirm(
+            `Call ${contact.name} at ${contact.phone}?\n\nThis will open your phone's dialer.`
+          );
+          if (confirmed) {
+            window.location.href = `tel:${contact.phone}`;
+          }
         }
       } else {
-        // Regular phone call
-        const confirmed = window.confirm(
-          `Call ${contact.name} at ${contact.phone}?\n\nThis will open your phone's dialer.`
-        );
-        if (confirmed) {
-          window.location.href = `tel:${contact.phone}`;
-        }
+        console.log('❌ Contact not configured, opening settings modal');
+        alert('Emergency contact not configured. Please set up emergency contacts first.');
+        console.log('🔧 Setting showEmergencySettings to true');
+        setShowEmergencySettings(true);
+        console.log('✅ Emergency settings modal should now be visible');
       }
-    } else {
-      alert('Emergency contact not configured. Please set up emergency contacts first.');
-      setShowEmergencySettings(true);
+    } catch (error) {
+      console.error('❌ Error in handleEmergencyCall:', error);
+      alert(`Error: ${error.message}\n\nPlease try again or check the console for details.`);
     }
   };
 
@@ -2838,6 +2852,36 @@ Try the diagnostic button below to see your current settings.`);
                 </div>
               </div>
 
+              {/* Emergency Settings Debug */}
+              <div className="bg-white rounded-xl shadow-sm p-4">
+                <h2 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                  <Phone className="w-5 h-5 mr-2 text-red-600" />
+                  Emergency Settings
+                </h2>
+                <div className="space-y-3">
+                  <button
+                    onClick={() => {
+                      console.log('🧪 Testing emergency settings modal');
+                      setShowEmergencySettings(true);
+                    }}
+                    className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium"
+                  >
+                    Configure Emergency Contacts
+                  </button>
+                  <div className="bg-yellow-50 p-3 rounded-lg">
+                    <p className="text-sm text-yellow-800">
+                      <strong>Current Status:</strong>
+                    </p>
+                    <p className="text-xs text-yellow-700 mt-1">
+                      Contact 1: {emergencyContacts[0]?.name || 'Not set'} - {emergencyContacts[0]?.phone || 'Not set'}
+                    </p>
+                    <p className="text-xs text-yellow-700">
+                      Contact 2: {emergencyContacts[1]?.name || 'Not set'} - {emergencyContacts[1]?.phone || 'Not set'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               {/* Data Management */}
               <div className="bg-white rounded-xl shadow-sm p-4">
                 <h2 className="text-lg font-semibold text-gray-900 mb-4">Data Management</h2>
@@ -3423,11 +3467,15 @@ Try the diagnostic button below to see your current settings.`);
       {/* Emergency Settings Modal */}
       {showEmergencySettings && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          {console.log('🔧 Emergency Settings Modal is rendering:', { showEmergencySettings, emergencyContacts })}
           <div className="bg-white rounded-lg max-w-md w-full p-6">
             <div className="flex justify-between items-center mb-4">
               <h3 className="text-lg font-semibold text-gray-900">Emergency Contacts</h3>
               <button
-                onClick={() => setShowEmergencySettings(false)}
+                onClick={() => {
+                  console.log('❌ Closing emergency settings modal');
+                  setShowEmergencySettings(false);
+                }}
                 className="text-gray-400 hover:text-gray-600"
               >
                 <X className="h-6 w-6" />
@@ -3444,22 +3492,32 @@ Try the diagnostic button below to see your current settings.`);
                     <input
                       type="text"
                       placeholder="Name"
-                      value={contact.name}
+                      value={contact.name || ''}
                       onChange={(e) => {
-                        const newContacts = [...emergencyContacts];
-                        newContacts[index].name = e.target.value;
-                        setEmergencyContacts(newContacts);
+                        try {
+                          console.log(`📝 Updating contact ${index} name:`, e.target.value);
+                          const newContacts = [...emergencyContacts];
+                          newContacts[index].name = e.target.value;
+                          setEmergencyContacts(newContacts);
+                        } catch (error) {
+                          console.error('❌ Error updating contact name:', error);
+                        }
                       }}
                       className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                     <input
                       type="tel"
                       placeholder="Phone"
-                      value={contact.phone}
+                      value={contact.phone || ''}
                       onChange={(e) => {
-                        const newContacts = [...emergencyContacts];
-                        newContacts[index].phone = e.target.value;
-                        setEmergencyContacts(newContacts);
+                        try {
+                          console.log(`📞 Updating contact ${index} phone:`, e.target.value);
+                          const newContacts = [...emergencyContacts];
+                          newContacts[index].phone = e.target.value;
+                          setEmergencyContacts(newContacts);
+                        } catch (error) {
+                          console.error('❌ Error updating contact phone:', error);
+                        }
                       }}
                       className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
@@ -3477,7 +3535,9 @@ Try the diagnostic button below to see your current settings.`);
                   </button>
                   <button
                     onClick={() => {
-                      localStorage.setItem('emergencyContacts', JSON.stringify(emergencyContacts));
+                      console.log('💾 Saving emergency contacts:', emergencyContacts);
+                      localStorage.setItem(STORAGE_KEYS.emergencyContacts, JSON.stringify(emergencyContacts));
+                      console.log('✅ Emergency contacts saved successfully');
                       setShowEmergencySettings(false);
                     }}
                     className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
