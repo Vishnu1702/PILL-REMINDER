@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2, Camera, Clock, Pill, Bell, Calendar, TrendingUp, AlertCircle, Check, X, BarChart3, Package, ChevronDown, ChevronRight, Settings, Info, Phone, AlertTriangle, Share2, Mic, MicOff, MessageCircle, MessageSquare, Mail, Copy, Printer } from 'lucide-react';
+import { Plus, Edit2, Trash2, Camera, Clock, Pill, Bell, Calendar, TrendingUp, AlertCircle, Check, X, BarChart3, Package, ChevronDown, ChevronRight, Settings, Info, Phone, AlertTriangle, Share2, Mic, MicOff, MessageCircle, MessageSquare, Mail, Copy, Printer, Home } from 'lucide-react';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import PrivacyPolicy from './PrivacyPolicy';
 
@@ -34,22 +34,30 @@ const MedicineReminderApp = () => {
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceResponse, setVoiceResponse] = useState('');
   const [showVoiceDialog, setShowVoiceDialog] = useState(false);
+  const [shareSelection, setShareSelection] = useState({}); // for selecting medicines to share
   const [formData, setFormData] = useState({
     patientName: '', // new field
+    doctorName: '', // optional doctor name field
+    itemType: 'medicine', // 'medicine' or 'non-medicine'
     name: '',
-    dosage: 1,
+    dosage: '',
     dosageType: 'tablet',
+    customDosageType: '', // for 'other' dosage type
     time: 'morning',
     color: '#3B82F6',
     image: null,
     notes: '',
     specificTime: '08:00',
-    alertTime: '08:00', // new field
-    alertType: 'notification', // new field: 'notification' or 'alarm'
+    alertTime: '07:59', // 1 min before specific time
+    alertType: 'notification', // 'notification' or 'alarm'
     totalPills: 1,
     currentPills: 1,
     refillReminder: 1,
-    frequency: 'daily' // daily, weekly, monthly
+    frequency: 'daily', // daily, every-other-day, every-n-days, specific-days, weekly, monthly, as-needed
+    frequencyDays: 2, // for every-n-days: the number of days
+    specificWeekDays: [], // for specific-days: array of day indices (0=Sun, 1=Mon, etc.)
+    reminderEndDate: '', // date to stop reminders
+    reminderDurationDays: '' // alternative: stop after N days
   });
 
   const timeSlots = {
@@ -459,6 +467,64 @@ const MedicineReminderApp = () => {
         setFormData(prev => ({ ...prev, image: e.target.result }));
       };
       reader.readAsDataURL(file);
+    }
+  };
+
+  // Schedule out-of-stock notification when stock hits 0
+  const scheduleOutOfStockNotification = async (medicine) => {
+    try {
+      if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+        console.log('Out of stock notification only works on native platform');
+        return;
+      }
+
+      // Check if medicine has ended based on reminderEndDate
+      if (medicine.reminderEndDate) {
+        const endDate = new Date(medicine.reminderEndDate);
+        if (new Date() > endDate) {
+          console.log('Medicine reminder period has ended, skipping out-of-stock notification');
+          return;
+        }
+      }
+
+      // Only for medicines (not non-medicine items) and when stock is 0
+      if (medicine.itemType === 'non-medicine' || medicine.currentPills > 0) {
+        return;
+      }
+
+      const notificationId = parseInt(medicine.id.replace(/\D/g, '').substring(0, 8)) + 50000;
+      
+      // Schedule for 9 AM today or tomorrow
+      const now = new Date();
+      const scheduleTime = new Date();
+      scheduleTime.setHours(9, 0, 0, 0);
+      
+      if (now.getHours() >= 9) {
+        // Schedule for tomorrow 9 AM
+        scheduleTime.setDate(scheduleTime.getDate() + 1);
+      }
+
+      const notificationConfig = {
+        title: '⚠️ Out of Stock Alert',
+        body: `${medicine.name} for ${medicine.patientName || 'Patient'} is out of stock! Please refill.`,
+        id: notificationId,
+        schedule: { at: scheduleTime },
+        channelId: 'notification-channel',
+        importance: 4,
+        priority: 1,
+        sound: 'default',
+        autoCancel: true,
+        extra: {
+          medicineId: medicine.id,
+          medicineName: medicine.name,
+          isOutOfStock: true
+        }
+      };
+
+      await LocalNotifications.schedule({ notifications: [notificationConfig] });
+      console.log('📦 Out of stock notification scheduled for:', medicine.name);
+    } catch (error) {
+      console.error('Error scheduling out of stock notification:', error);
     }
   };
 
@@ -964,20 +1030,25 @@ const MedicineReminderApp = () => {
 
     setFormData({
       patientName: '',
+      itemType: 'medicine',
       name: '',
-      dosage: 1,
+      dosage: '1',
       dosageType: 'tablet',
       time: 'morning',
       color: '#3B82F6',
       image: null,
       notes: '',
       specificTime: '08:00',
-      alertTime: '08:00',
+      alertTime: '07:55',
       alertType: 'notification',
       totalPills: 1,
       currentPills: 1,
       refillReminder: 1,
-      frequency: 'daily'
+      frequency: 'daily',
+      frequencyDays: 2,
+      specificWeekDays: [],
+      reminderEndDate: '',
+      reminderDurationDays: ''
     });
   };
 
@@ -1002,7 +1073,18 @@ const MedicineReminderApp = () => {
   };
 
   const editMedicine = (medicine) => {
-    setFormData(medicine);
+    // Ensure all new fields have defaults for backwards compatibility
+    setFormData({
+      ...medicine,
+      doctorName: medicine.doctorName || '',
+      itemType: medicine.itemType || 'medicine',
+      dosage: String(medicine.dosage || 1),
+      customDosageType: medicine.customDosageType || '',
+      frequencyDays: medicine.frequencyDays || 2,
+      specificWeekDays: medicine.specificWeekDays || [],
+      reminderEndDate: medicine.reminderEndDate || '',
+      reminderDurationDays: medicine.reminderDurationDays || ''
+    });
     setEditingMedicine(medicine);
     setShowAddForm(true);
   };
@@ -1030,14 +1112,20 @@ const MedicineReminderApp = () => {
     };
     setDosageHistory(prev => [...prev, dosageRecord]);
 
-    // Update pill count
+    // Update pill count and check for out of stock
+    const newPillCount = Math.max(0, medicine.currentPills - 1);
     setMedicines(prev =>
       prev.map(med =>
         med.id === medicineId
-          ? { ...med, currentPills: Math.max(0, med.currentPills - 1) }
+          ? { ...med, currentPills: newPillCount }
           : med
       )
     );
+
+    // Schedule out of stock notification if pills hit 0
+    if (newPillCount === 0 && medicine.itemType !== 'non-medicine') {
+      scheduleOutOfStockNotification({ ...medicine, currentPills: 0 });
+    }
   };
 
   const markMedicineMissed = (notificationId) => {
@@ -1095,20 +1183,27 @@ const MedicineReminderApp = () => {
 
     setFormData({
       patientName: '',
+      doctorName: '',
+      itemType: 'medicine',
       name: '',
-      dosage: 1,
+      dosage: '1',
       dosageType: 'tablet',
+      customDosageType: '',
       time: defaultTimeSlot,
       color: '#3B82F6',
       image: null,
       notes: '',
       specificTime: defaultTime,
-      alertTime: defaultTime,
+      alertTime: calculateAlertTime(defaultTime),
       alertType: 'notification',
       totalPills: 1,
       currentPills: 1,
       refillReminder: 1,
-      frequency: 'daily'
+      frequency: 'daily',
+      frequencyDays: 2,
+      specificWeekDays: [],
+      reminderEndDate: '',
+      reminderDurationDays: ''
     });
     setShowAddForm(true);
   };
@@ -1119,20 +1214,27 @@ const MedicineReminderApp = () => {
     setShowSuccessDialog(false);
     setFormData({
       patientName: '',
+      doctorName: '',
+      itemType: 'medicine',
       name: '',
-      dosage: 1,
+      dosage: '1',
       dosageType: 'tablet',
+      customDosageType: '',
       time: 'morning',
       color: '#3B82F6',
       image: null,
       notes: '',
       specificTime: '08:00',
-      alertTime: '08:00',
+      alertTime: '07:59',
       alertType: 'notification',
       totalPills: 1,
       currentPills: 1,
       refillReminder: 1,
-      frequency: 'daily'
+      frequency: 'daily',
+      frequencyDays: 2,
+      specificWeekDays: [],
+      reminderEndDate: '',
+      reminderDurationDays: ''
     });
   };
 
@@ -1145,6 +1247,23 @@ const MedicineReminderApp = () => {
     return 'night';                                   // 8 PM - 4:59 AM
   };
 
+  // Function to calculate alert time (1 minute before specific time)
+  const calculateAlertTime = (specificTime) => {
+    const [hours, minutes] = specificTime.split(':').map(Number);
+    let alertMinutes = minutes - 1;
+    let alertHours = hours;
+    
+    if (alertMinutes < 0) {
+      alertMinutes += 60;
+      alertHours -= 1;
+      if (alertHours < 0) {
+        alertHours = 23;
+      }
+    }
+    
+    return `${alertHours.toString().padStart(2, '0')}:${alertMinutes.toString().padStart(2, '0')}`;
+  };
+
   // Function to update form data and auto-sync time slot
   const updateFormData = (field, value) => {
     setFormData(prev => {
@@ -1153,11 +1272,31 @@ const MedicineReminderApp = () => {
       // Auto-update time slot when specific time changes
       if (field === 'specificTime') {
         newData.time = getTimeSlotFromTime(value);
-        newData.alertTime = value; // Keep alert time in sync
+        newData.alertTime = calculateAlertTime(value); // Set alert time 1 min before
       }
 
       return newData;
     });
+  };
+
+  // Function to calculate end date from number of days
+  const calculateEndDateFromDays = (days) => {
+    if (!days || days <= 0) return '';
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() + parseInt(days));
+    return endDate.toISOString().split('T')[0];
+  };
+
+  // Function to calculate number of days from end date
+  const calculateDaysFromEndDate = (endDateStr) => {
+    if (!endDateStr) return '';
+    const endDate = new Date(endDateStr);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    endDate.setHours(0, 0, 0, 0);
+    const diffTime = endDate - today;
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    return diffDays > 0 ? diffDays.toString() : '';
   };
 
   // Get unique patient names for dropdown
@@ -2003,7 +2142,11 @@ After enabling the permission, come back to the app and test the native alarm!`)
         totalPills: 10,
         currentPills: 10,
         refillReminder: 2,
-        frequency: 'daily'
+        frequency: 'daily',
+        frequencyDays: 2,
+        specificWeekDays: [],
+        reminderEndDate: '',
+        reminderDurationDays: ''
       };
 
       console.log('🔧 Test medicine configuration:', {
@@ -2061,7 +2204,11 @@ After enabling the permission, come back to the app and test the native alarm!`)
         totalPills: 10,
         currentPills: 10,
         refillReminder: 2,
-        frequency: 'daily'
+        frequency: 'daily',
+        frequencyDays: 2,
+        specificWeekDays: [],
+        reminderEndDate: '',
+        reminderDurationDays: ''
       };
 
       console.log('🔧 Test notification medicine configuration:', {
@@ -2119,7 +2266,11 @@ After enabling the permission, come back to the app and test the native alarm!`)
         totalPills: 10,
         currentPills: 10,
         refillReminder: 2,
-        frequency: 'daily'
+        frequency: 'daily',
+        frequencyDays: 2,
+        specificWeekDays: [],
+        reminderEndDate: '',
+        reminderDurationDays: ''
       };
 
       console.log('🚨 NATIVE ALARM TEST medicine configuration:', {
@@ -2797,10 +2948,10 @@ Try the diagnostic button below to see your current settings.`);
   const getCurrentTimeSlot = () => {
     const now = new Date();
     const hour = now.getHours();
-    if (hour >= 4 && hour < 12) return 'morning';
-    if (hour >= 12 && hour < 16) return 'afternoon';
-    if (hour >= 16 && hour < 19) return 'evening';
-    return 'night';
+    if (hour >= 5 && hour < 12) return 'morning';    // 5 AM - 11:59 AM
+    if (hour >= 12 && hour < 16) return 'afternoon'; // 12 PM - 3:59 PM
+    if (hour >= 16 && hour < 20) return 'evening';   // 4 PM - 7:59 PM
+    return 'night';                                  // 8 PM - 4:59 AM
   };
 
   // Auto-select the time-of-day tab based on current time on mount
@@ -2831,7 +2982,10 @@ Try the diagnostic button below to see your current settings.`);
           <div className="flex-1">
             <h3 className="font-semibold text-gray-900">{medicine.name}</h3>
             <p className="text-xs text-blue-600 font-semibold mb-1">{medicine.patientName}</p>
-            <p className="text-sm text-gray-600">{medicine.dosage} {medicine.dosageType}</p>
+            {medicine.doctorName && (
+              <p className="text-xs text-purple-600 mb-1">👨‍⚕️ {medicine.doctorName}</p>
+            )}
+            <p className="text-sm text-gray-600">{medicine.dosage} {medicine.dosageType === 'other' ? (medicine.customDosageType || 'unit') : medicine.dosageType}</p>
             <p className="text-xs text-gray-500">⏰ {medicine.specificTime}</p>
             <div className="flex items-center mt-2 space-x-3">
               <div className="flex items-center text-xs text-gray-500">
@@ -3055,6 +3209,111 @@ Try the diagnostic button below to see your current settings.`);
 
     listText += `\n⚠️ Disclaimer: This list is for reference only. Always consult healthcare providers for medical advice.\n`;
     listText += `📱 Generated by MyMedAlert - Medicine Reminder App`;
+
+    return listText;
+  };
+
+  // Calculate stock needed until end date
+  const calculateStockNeeded = (med) => {
+    if (!med.reminderEndDate) return null;
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const endDate = new Date(med.reminderEndDate);
+    endDate.setHours(0, 0, 0, 0);
+    
+    if (endDate <= today) return null;
+    
+    const daysRemaining = Math.ceil((endDate - today) / (1000 * 60 * 60 * 24));
+    const dosagePerDay = parseInt(med.dosage) || 1;
+    
+    // Adjust for frequency
+    let stockNeeded = 0;
+    switch (med.frequency) {
+      case 'daily':
+        stockNeeded = daysRemaining * dosagePerDay;
+        break;
+      case 'every-other-day':
+        stockNeeded = Math.ceil(daysRemaining / 2) * dosagePerDay;
+        break;
+      case 'every-n-days':
+        stockNeeded = Math.ceil(daysRemaining / (med.frequencyDays || 2)) * dosagePerDay;
+        break;
+      case 'weekly':
+        stockNeeded = Math.ceil(daysRemaining / 7) * dosagePerDay;
+        break;
+      case 'monthly':
+        stockNeeded = Math.ceil(daysRemaining / 30) * dosagePerDay;
+        break;
+      case 'specific-days':
+        // Estimate based on selected days per week
+        const daysPerWeek = (med.specificWeekDays?.length || 1);
+        stockNeeded = Math.ceil(daysRemaining * daysPerWeek / 7) * dosagePerDay;
+        break;
+      default:
+        stockNeeded = daysRemaining * dosagePerDay;
+    }
+    
+    return stockNeeded;
+  };
+
+  // Generate medicine list for selected medicines only (grouped by patient and time)
+  const generateSelectedMedicineList = (selectedMeds) => {
+    const currentDate = new Date().toLocaleDateString();
+    
+    // Group by patient
+    const patientGroups = {};
+    selectedMeds.forEach(med => {
+      const patient = med.patientName || 'General';
+      if (!patientGroups[patient]) {
+        patientGroups[patient] = { morning: [], afternoon: [], evening: [], night: [] };
+      }
+      patientGroups[patient][med.time]?.push(med);
+    });
+
+    let listText = `📋 Medicine Schedule - ${currentDate}\n`;
+    listText += `Generated by MyMedAlert App\n\n`;
+
+    Object.entries(patientGroups).forEach(([patient, timeGroups]) => {
+      listText += `👤 ${patient}:\n`;
+      listText += `${'─'.repeat(30)}\n`;
+      
+      ['morning', 'afternoon', 'evening', 'night'].forEach(timeSlot => {
+        const medsInSlot = timeGroups[timeSlot];
+        if (medsInSlot && medsInSlot.length > 0) {
+          listText += `\n${timeSlots[timeSlot]?.icon} ${timeSlots[timeSlot]?.label}:\n`;
+          medsInSlot.forEach(med => {
+            const itemIcon = med.itemType === 'non-medicine' ? '📋' : '💊';
+            const dosageTypeDisplay = med.dosageType === 'other' ? (med.customDosageType || 'unit') : med.dosageType;
+            listText += `  ${itemIcon} ${med.name}\n`;
+            if (med.doctorName) {
+              listText += `     👨‍⚕️ ${med.doctorName}\n`;
+            }
+            listText += `     ${med.dosage} ${dosageTypeDisplay} at ${med.specificTime}\n`;
+            if (med.itemType !== 'non-medicine' && med.currentPills !== undefined) {
+              listText += `     📦 Stock Left: ${med.currentPills}/${med.totalPills}\n`;
+              const stockNeeded = calculateStockNeeded(med);
+              if (stockNeeded !== null) {
+                const shortage = stockNeeded - med.currentPills;
+                listText += `     📊 Stock Needed (till ${med.reminderEndDate}): ${stockNeeded}\n`;
+                if (shortage > 0) {
+                  listText += `     ⚠️ Shortage: ${shortage} more needed\n`;
+                } else {
+                  listText += `     ✅ Sufficient stock\n`;
+                }
+              }
+            }
+            if (med.notes) {
+              listText += `     📝 ${med.notes}\n`;
+            }
+          });
+        }
+      });
+      listText += `\n`;
+    });
+
+    listText += `⚠️ Disclaimer: For reference only. Consult healthcare providers for medical advice.\n`;
+    listText += `📱 Generated by MyMedAlert`;
 
     return listText;
   };
@@ -3329,201 +3588,138 @@ Try the diagnostic button below to see your current settings.`);
         {/* Subtle background pattern */}
         <div className="absolute inset-0 bg-gradient-to-br from-blue-50/30 via-white to-purple-50/20 pointer-events-none"></div>
 
-        <div className="relative px-4 sm:px-6 py-5 sm:py-6">
+        <div className="relative px-3 sm:px-4 py-2 sm:py-3">
           <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-4">
+            <div className="flex items-center space-x-3">
               {/* App Icon with modern styling */}
               <div className="relative">
-                <div className="w-12 h-12 bg-gradient-to-br from-blue-500 to-blue-600 rounded-2xl shadow-lg flex items-center justify-center transform hover:scale-105 transition-transform duration-200">
-                  <Bell className="w-6 h-6 text-white" />
+                <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl shadow-lg flex items-center justify-center">
+                  <span className="text-xl">💊</span>
                 </div>
-                {getPendingNotifications().length > 0 && (
-                  <div className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 rounded-full flex items-center justify-center shadow-sm">
-                    <span className="text-white text-xs font-bold">{getPendingNotifications().length}</span>
-                  </div>
-                )}
               </div>
 
               {/* App Title and Info */}
               <div>
-                <h1 className="text-2xl sm:text-3xl font-bold bg-gradient-to-r from-gray-900 via-blue-800 to-purple-800 bg-clip-text text-transparent leading-tight">
+                <h1 className="text-xl sm:text-2xl font-bold bg-gradient-to-r from-gray-900 via-blue-800 to-purple-800 bg-clip-text text-transparent leading-tight">
                   MyMedAlert
                 </h1>
-                <p className="text-sm font-medium text-gray-500 mt-0.5">
-                  Smart Medicine Reminder
-                </p>
-                <div className="flex items-center space-x-3 mt-1">
-                  <div className="flex items-center space-x-1">
-                    <div className="w-2 h-2 bg-green-400 rounded-full"></div>
-                    <span className="text-xs text-gray-600 font-medium">{medicines.length} medicines</span>
-                  </div>
-                  {getPendingNotifications().length > 0 && (
-                    <div className="flex items-center space-x-1">
-                      <div className="w-2 h-2 bg-orange-400 rounded-full animate-pulse"></div>
-                      <span className="text-xs text-gray-600 font-medium">{getPendingNotifications().length} pending</span>
-                    </div>
-                  )}
-                </div>
+                <p className="text-xs text-gray-500">Smart Medicine Reminder</p>
               </div>
             </div>
 
-            {/* Emergency and Action Buttons */}
-            <div className="flex flex-col space-y-2">
-              {/* Emergency Label */}
-              <div className="text-center">
-                <p className="text-xs text-gray-500 font-medium">Emergency Contacts</p>
-              </div>
+            {/* Emergency and Action Buttons - All in one row */}
+            <div className="flex items-center space-x-1.5">
+              {/* Emergency Button 1 - Phone */}
+              <button
+                onClick={() => handleEmergencyCall(0, 'phone')}
+                className="bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white p-2 rounded-lg shadow-md transition-all"
+                title={emergencyContacts[0]?.name && emergencyContacts[0]?.phone
+                  ? `Emergency Call: ${emergencyContacts[0].name} (${emergencyContacts[0].phone})`
+                  : 'Emergency Contact 1'}
+              >
+                <div className="relative">
+                  <Phone className="w-3.5 h-3.5" />
+                  <span className="absolute -top-1 -right-1 text-white font-bold" style={{ fontSize: '7px' }}>1</span>
+                </div>
+              </button>
 
-              {/* First Row - Emergency Calls */}
-              <div className="flex items-center justify-center space-x-2">
-                {/* Emergency Button 1 - Phone */}
-                <button
-                  onClick={() => handleEmergencyCall(0, 'phone')}
-                  className="group relative bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white p-3 rounded-xl shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
-                  title={emergencyContacts[0]?.name && emergencyContacts[0]?.phone
-                    ? `Emergency Call: ${emergencyContacts[0].name} (${emergencyContacts[0].phone})`
-                    : 'Emergency Contact 1 - Click to configure'}
-                >
-                  <div className="relative">
-                    <Phone className="w-4 h-4" />
-                    <span
-                      className="absolute -top-1 -right-1 text-white flex items-center justify-center font-bold"
-                      style={{
-                        fontSize: '8px',
-                        width: '12px',
-                        height: '12px',
-                        lineHeight: '1'
-                      }}
-                    >
-                      1
-                    </span>
-                  </div>
-                  <div className="absolute inset-0 rounded-xl bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
-                </button>
+              {/* Emergency Button 2 - Phone */}
+              <button
+                onClick={() => handleEmergencyCall(1, 'phone')}
+                className="bg-gradient-to-r from-orange-600 to-orange-700 hover:from-orange-700 hover:to-orange-800 text-white p-2 rounded-lg shadow-md transition-all"
+                title={emergencyContacts[1]?.name && emergencyContacts[1]?.phone
+                  ? `Emergency Call: ${emergencyContacts[1].name} (${emergencyContacts[1].phone})`
+                  : 'Emergency Contact 2'}
+              >
+                <div className="relative">
+                  <Phone className="w-3.5 h-3.5" />
+                  <span className="absolute -top-1 -right-1 text-white font-bold" style={{ fontSize: '7px' }}>2</span>
+                </div>
+              </button>
 
-                {/* Emergency Button 2 - Phone */}
-                <button
-                  onClick={() => handleEmergencyCall(1, 'phone')}
-                  className="group relative bg-gradient-to-r from-orange-600 to-orange-700 hover:from-orange-700 hover:to-orange-800 text-white p-3 rounded-xl shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
-                  title={emergencyContacts[1]?.name && emergencyContacts[1]?.phone
-                    ? `Emergency Call: ${emergencyContacts[1].name} (${emergencyContacts[1].phone})`
-                    : 'Emergency Contact 2 - Click to configure'}
-                >
-                  <div className="relative">
-                    <Phone className="w-4 h-4" />
-                    <span
-                      className="absolute -top-1 -right-1 text-white flex items-center justify-center font-bold"
-                      style={{
-                        fontSize: '8px',
-                        width: '12px',
-                        height: '12px',
-                        lineHeight: '1'
-                      }}
-                    >
-                      2
-                    </span>
-                  </div>
-                  <div className="absolute inset-0 rounded-xl bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
-                </button>
+              {/* WhatsApp Emergency Button */}
+              <button
+                onClick={() => handleEmergencyCall(0, 'whatsapp')}
+                className="bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white p-2 rounded-lg shadow-md transition-all"
+                title="WhatsApp Emergency"
+              >
+                <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.890-5.335 11.893-11.893A11.821 11.821 0 0020.885 3.787" />
+                </svg>
+              </button>
 
-                {/* WhatsApp Emergency Button */}
-                <button
-                  onClick={() => handleEmergencyCall(0, 'whatsapp')}
-                  className="group relative bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white p-2 rounded-xl shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
-                  title={emergencyContacts[0]?.name && emergencyContacts[0]?.phone
-                    ? `WhatsApp: ${emergencyContacts[0].name} (${emergencyContacts[0].phone})`
-                    : 'WhatsApp Emergency Contact - Click to configure'}
-                >
-                  <div className="flex items-center justify-center">
-                    <svg
-                      className="w-4 h-4"
-                      viewBox="0 0 24 24"
-                      fill="currentColor"
-                    >
-                      <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.890-5.335 11.893-11.893A11.821 11.821 0 0020.885 3.787" />
-                    </svg>
-                  </div>
-                  <div className="absolute inset-0 rounded-xl bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
-                </button>
-              </div>
+              {/* Share Button */}
+              <button
+                onClick={() => setShowSharingDialog(true)}
+                className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white p-2 rounded-lg shadow-md transition-all"
+                title="Share Medicine List"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+              </button>
 
-              {/* Second Row - Share and Voice */}
-              <div className="flex items-center justify-center space-x-2">
-                {/* Share Button */}
-                <button
-                  onClick={() => setShowSharingDialog(true)}
-                  className="group relative bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800 text-white p-2 rounded-xl shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
-                  title="Share Medicine List"
-                >
-                  <Share2 className="w-4 h-4" />
-                  <div className="absolute inset-0 rounded-xl bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
-                </button>
-
-                {/* Voice Assistant Button */}
-                <button
-                  onClick={startVoiceListening}
-                  className={`group relative bg-gradient-to-r transition-all duration-200 transform hover:scale-105 active:scale-95 text-white p-2 rounded-xl shadow-lg hover:shadow-xl ${voiceListening
-                    ? 'from-purple-600 to-purple-700 hover:from-purple-700 hover:to-purple-800'
-                    : 'from-indigo-600 to-indigo-700 hover:from-indigo-700 hover:to-indigo-800'
-                    }`}
-                  title="Voice Assistant"
-                >
-                  {voiceListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                  <div className="absolute inset-0 rounded-xl bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity duration-200"></div>
-                </button>
-              </div>
+              {/* Voice Assistant Button */}
+              <button
+                onClick={startVoiceListening}
+                className={`p-2 rounded-lg shadow-md transition-all text-white ${voiceListening
+                  ? 'bg-gradient-to-r from-purple-600 to-purple-700'
+                  : 'bg-gradient-to-r from-indigo-600 to-indigo-700'
+                }`}
+                title="Voice Assistant"
+              >
+                {voiceListening ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+              </button>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Navigation Tabs */}
+      {/* Navigation Tabs - Icons Only */}
       <div className="bg-white border-b flex-shrink-0">
-        <div className="flex overflow-x-auto no-scrollbar">
+        <div className="flex">
           <button
             onClick={() => setCurrentView('medicines')}
-            className={`flex-1 px-4 py-3 text-center border-b-2 transition-colors ${currentView === 'medicines'
+            className={`flex-1 py-2 flex flex-col items-center justify-center border-b-2 transition-colors ${currentView === 'medicines'
               ? 'border-fuchsia-500 bg-gradient-to-r from-yellow-300 via-fuchsia-400 to-blue-400 text-gray-900 font-bold shadow-md'
-              : 'border-transparent bg-gray-100 hover:bg-yellow-50 font-semibold text-gray-800'
+              : 'border-transparent bg-gray-100 hover:bg-yellow-50 text-gray-600'
               }`}
+            title="Home"
           >
-            <Pill className={`w-5 h-5 mx-auto mb-1 ${currentView === 'medicines' ? '' : 'text-gray-800'}`} />
-            <span className={`text-sm font-medium ${currentView === 'medicines' ? '' : 'text-gray-800'}`}>Medicines</span>
+            <Home className="w-5 h-5" />
           </button>
           <button
             onClick={() => setCurrentView('notifications')}
-            className={`flex-1 px-4 py-3 text-center border-b-2 transition-colors relative ${currentView === 'notifications'
+            className={`flex-1 py-2 flex flex-col items-center justify-center border-b-2 transition-colors relative ${currentView === 'notifications'
               ? 'border-fuchsia-500 bg-gradient-to-r from-blue-400 via-fuchsia-400 to-yellow-300 text-gray-900 font-bold shadow-md'
-              : 'border-transparent bg-gray-100 hover:bg-blue-50 font-semibold text-gray-800'
+              : 'border-transparent bg-gray-100 hover:bg-blue-50 text-gray-600'
               }`}
+            title="Notifications"
           >
-            <Bell className={`w-5 h-5 mx-auto mb-1 ${currentView === 'notifications' ? '' : 'text-gray-800'}`} />
-            <span className={`text-sm font-medium ${currentView === 'notifications' ? '' : 'text-gray-800'}`}>Notifications</span>
+            <Bell className="w-5 h-5" />
             {getPendingNotifications().length > 0 && (
-              <span className="absolute top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center z-50">
+              <span className="absolute top-0.5 right-1/4 bg-red-500 text-white text-xs rounded-full h-4 w-4 flex items-center justify-center z-50" style={{ fontSize: '10px' }}>
                 {getPendingNotifications().length}
               </span>
             )}
           </button>
           <button
             onClick={() => setCurrentView('tracking')}
-            className={`flex-1 px-4 py-3 text-center border-b-2 transition-colors ${currentView === 'tracking'
+            className={`flex-1 py-2 flex flex-col items-center justify-center border-b-2 transition-colors ${currentView === 'tracking'
               ? 'border-fuchsia-500 bg-gradient-to-r from-green-300 via-blue-400 to-fuchsia-400 text-gray-900 font-bold shadow-md'
-              : 'border-transparent bg-gray-100 hover:bg-green-50 font-semibold text-gray-800'
+              : 'border-transparent bg-gray-100 hover:bg-green-50 text-gray-600'
               }`}
+            title="Tracking"
           >
-            <BarChart3 className={`w-5 h-5 mx-auto mb-1 ${currentView === 'tracking' ? '' : 'text-gray-800'}`} />
-            <span className={`text-sm font-medium ${currentView === 'tracking' ? '' : 'text-gray-800'}`}>Tracking</span>
+            <BarChart3 className="w-5 h-5" />
           </button>
           <button
             onClick={() => setCurrentView('settings')}
-            className={`flex-1 px-4 py-3 text-center border-b-2 transition-colors ${currentView === 'settings'
+            className={`flex-1 py-2 flex flex-col items-center justify-center border-b-2 transition-colors ${currentView === 'settings'
               ? 'border-fuchsia-500 bg-gradient-to-r from-purple-300 via-pink-400 to-fuchsia-400 text-gray-900 font-bold shadow-md'
-              : 'border-transparent bg-gray-100 hover:bg-purple-50 font-semibold text-gray-800'
+              : 'border-transparent bg-gray-100 hover:bg-purple-50 text-gray-600'
               }`}
+            title="Settings"
           >
-            <Settings className={`w-5 h-5 mx-auto mb-1 ${currentView === 'settings' ? '' : 'text-gray-800'}`} />
-            <span className={`text-sm font-medium ${currentView === 'settings' ? '' : 'text-gray-800'}`}>Settings</span>
+            <Settings className="w-5 h-5" />
           </button>
         </div>
       </div>
@@ -3560,14 +3756,16 @@ Try the diagnostic button below to see your current settings.`);
                     <button
                       key={key}
                       onClick={() => setActiveTab(key)}
-                      className={`flex-1 min-w-0 px-4 py-3 text-center border-b-2 transition-colors ${activeTab === key
+                      className={`flex-1 min-w-0 px-2 py-1.5 text-center border-b-2 transition-colors ${activeTab === key
                         ? `border-fuchsia-500 ${activeGradient} text-gray-900 font-bold shadow-md`
                         : 'border-transparent bg-gray-100 hover:bg-yellow-50 font-semibold text-gray-800'
                         }`}
                     >
-                      <div className={`text-lg ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.icon}</div>
-                      <div className={`text-sm font-medium ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.label}</div>
-                      <div className={`text-xs ${activeTab === key ? 'text-gray-500' : 'text-gray-600'}`}>{slot.time}</div>
+                      <div className="flex items-center justify-center gap-1">
+                        <span className={`text-sm ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.icon}</span>
+                        <span className={`text-xs font-medium ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.label}</span>
+                      </div>
+                      <div className={`text-[10px] ${activeTab === key ? 'text-gray-600' : 'text-gray-500'}`}>{slot.time}</div>
                     </button>
                   );
                 })}
@@ -3825,829 +4023,6 @@ Try the diagnostic button below to see your current settings.`);
                 </div>
               </div>
 
-              {/* Alarm Testing Debug */}
-              <div className="bg-white rounded-xl shadow-sm p-4">
-                <h2 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                  <Bell className="w-5 h-5 mr-2 text-blue-600" />
-                  Alarm Testing
-                </h2>
-                <div className="space-y-3">
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🧪 Testing immediate alarm...');
-
-                        if (window.Capacitor && window.Capacitor.isNativePlatform()) {
-                          const testTime = new Date(Date.now() + 5000); // 5 seconds from now
-
-                          const testConfig = {
-                            title: '🧪 ALARM TEST',
-                            body: 'This is a 5-second alarm test!',
-                            id: 99999,
-                            schedule: { at: testTime },
-                            channelId: 'alarm-channel',
-                            importance: 5,
-                            priority: 2,
-                            sound: 'default',
-                            vibrate: [1000, 500, 1000],
-                            lights: true,
-                            lightColor: '#FF0000'
-                          };
-
-                          await LocalNotifications.schedule({
-                            notifications: [testConfig]
-                          });
-
-                          console.log('✅ Test alarm scheduled');
-                          alert('🧪 Test alarm scheduled for 5 seconds!');
-                        } else {
-                          alert('Alarm test only works on Android device');
-                        }
-                      } catch (error) {
-                        console.error('❌ Alarm test error:', error);
-                        alert('Alarm test failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
-                  >
-                    🧪 Test 5-Second Alarm
-                  </button>
-
-                  <button
-                    onClick={diagnoseNativeAlarmSystem}
-                    className="w-full p-3 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors font-medium"
-                  >
-                    🔍 Complete Alarm Diagnosis
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🔍 Checking pending notifications...');
-                        const pending = await LocalNotifications.getPending();
-                        console.log('📋 Pending notifications:', pending);
-
-                        // Show detailed info about each notification
-                        const now = new Date();
-                        let details = `📋 Pending notifications: ${pending.notifications?.length || 0}\n\n`;
-
-                        pending.notifications?.forEach((notification, index) => {
-                          const scheduleTime = new Date(notification.schedule?.at || 0);
-                          const isPast = scheduleTime < now;
-                          const timeUntil = Math.round((scheduleTime.getTime() - now.getTime()) / (1000 * 60));
-
-                          details += `${index + 1}. ${notification.title}\n`;
-                          details += `   Time: ${scheduleTime.toLocaleString()}\n`;
-                          details += `   Status: ${isPast ? '⚠️ PAST TIME' : '✅ Future'}\n`;
-                          details += `   ${isPast ? `Was ${-timeUntil} min ago` : `In ${timeUntil} min`}\n\n`;
-                        });
-
-                        alert(details + 'Check console for full details.');
-                      } catch (error) {
-                        console.error('❌ Error checking notifications:', error);
-                        alert('Error checking notifications: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors font-medium"
-                  >
-                    🔍 Check Pending Notifications
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🔄 Testing reschedule all notifications...');
-                        await rescheduleAllNotifications();
-
-                        // Wait a moment then check what was scheduled
-                        setTimeout(async () => {
-                          const pending = await LocalNotifications.getPending();
-                          console.log('📋 After reschedule - Pending notifications:', pending);
-                          alert(`🔄 Reschedule completed!\n\nNew pending notifications: ${pending.notifications?.length || 0}\n\nCheck console for details.`);
-                        }, 1000);
-                      } catch (error) {
-                        console.error('❌ Reschedule test error:', error);
-                        alert('Reschedule test failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors font-medium"
-                  >
-                    🔄 Test Reschedule All
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🧹 Manually cleaning up past notifications...');
-                        await cleanupPastNotifications();
-
-                        // Check what's left after cleanup
-                        setTimeout(async () => {
-                          const pending = await LocalNotifications.getPending();
-                          alert(`🧹 Cleanup completed!\n\nRemaining notifications: ${pending.notifications?.length || 0}\n\nCheck console for details.`);
-                        }, 500);
-                      } catch (error) {
-                        console.error('❌ Cleanup error:', error);
-                        alert('Cleanup failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium"
-                  >
-                    🧹 Clean Past Notifications
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🔕 Manual dismiss all active notifications...');
-
-                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('❌ Dismiss only available on Android device');
-                          return;
-                        }
-
-                        const pending = await LocalNotifications.getPending();
-                        const totalPending = pending.notifications?.length || 0;
-
-                        if (totalPending === 0) {
-                          alert('ℹ️ No active notifications to dismiss');
-                          return;
-                        }
-
-                        // Cancel all pending notifications
-                        await LocalNotifications.cancel({
-                          notifications: pending.notifications.map(n => ({ id: n.id }))
-                        });
-
-                        // Also cancel any native alarms
-                        for (const medicine of medicines) {
-                          if (medicine.alertType === 'native-alarm') {
-                            await cancelNativeAlarm(medicine.id);
-                          }
-                        }
-
-                        console.log(`✅ Dismissed ${totalPending} notifications`);
-                        alert(`✅ Dismissed ${totalPending} active notifications and alarms! 🔕`);
-
-                      } catch (error) {
-                        console.error('❌ Error dismissing notifications:', error);
-                        alert('❌ Error dismissing notifications: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium"
-                  >
-                    🔕 Dismiss All Active Alarms
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('⏰ Snooze all active notifications for 5 minutes...');
-
-                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('❌ Snooze only available on Android device');
-                          return;
-                        }
-
-                        const pending = await LocalNotifications.getPending();
-                        const activeNotifs = pending.notifications || [];
-
-                        if (activeNotifs.length === 0) {
-                          alert('ℹ️ No active notifications to snooze');
-                          return;
-                        }
-
-                        let snoozedCount = 0;
-                        const snoozeTime = new Date(Date.now() + 5 * 60 * 1000);
-
-                        // Cancel current notifications and reschedule them
-                        await LocalNotifications.cancel({
-                          notifications: activeNotifs.map(n => ({ id: n.id }))
-                        });
-
-                        const snoozeNotifications = activeNotifs.map(notif => ({
-                          ...notif,
-                          id: notif.id + 20000, // New ID to avoid conflicts
-                          title: `🔔 ${notif.extra?.medicineName || 'Medicine'} (Snoozed)`,
-                          body: `Reminder: ${notif.body}`,
-                          schedule: { at: snoozeTime },
-                          extra: {
-                            ...notif.extra,
-                            isSnoozed: true,
-                            originalTime: notif.schedule?.at,
-                            snoozeTime: snoozeTime.getTime()
-                          }
-                        }));
-
-                        if (snoozeNotifications.length > 0) {
-                          await LocalNotifications.schedule({
-                            notifications: snoozeNotifications
-                          });
-                          snoozedCount = snoozeNotifications.length;
-                        }
-
-                        console.log(`⏰ Snoozed ${snoozedCount} notifications until ${snoozeTime.toLocaleTimeString()}`);
-                        alert(`⏰ Snoozed ${snoozedCount} notifications for 5 minutes!\nNext reminders: ${snoozeTime.toLocaleTimeString()}`);
-
-                      } catch (error) {
-                        console.error('❌ Error snoozing notifications:', error);
-                        alert('❌ Error snoozing notifications: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-yellow-500 text-white rounded-lg hover:bg-yellow-600 transition-colors font-medium"
-                  >
-                    ⏰ Snooze All for 5 Minutes
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🔍 COMPREHENSIVE NOTIFICATION DIAGNOSTIC...');
-
-                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('❌ Diagnostics only available on Android device');
-                          return;
-                        }
-
-                        const now = new Date();
-                        console.log('📅 Current time:', now.toLocaleString());
-
-                        // Check all pending notifications
-                        const pending = await LocalNotifications.getPending();
-                        console.log('📋 Raw pending notifications:', pending);
-
-                        let diagnosticReport = `🔍 NOTIFICATION DIAGNOSTIC REPORT\n`;
-                        diagnosticReport += `📅 Current Time: ${now.toLocaleString()}\n`;
-                        diagnosticReport += `📋 Total Pending: ${pending.notifications?.length || 0}\n\n`;
-
-                        if (pending.notifications && pending.notifications.length > 0) {
-                          diagnosticReport += `📝 DETAILED BREAKDOWN:\n\n`;
-
-                          pending.notifications.forEach((notif, index) => {
-                            const scheduleTime = new Date(notif.schedule?.at || 0);
-                            const timeDiff = scheduleTime.getTime() - now.getTime();
-                            const minutesFromNow = Math.round(timeDiff / (1000 * 60));
-                            const isPast = timeDiff < 0;
-
-                            diagnosticReport += `${index + 1}. ${notif.title}\n`;
-                            diagnosticReport += `   📅 Scheduled: ${scheduleTime.toLocaleString()}\n`;
-                            diagnosticReport += `   ⏰ Status: ${isPast ? '⚠️ PAST TIME' : '✅ Future'}\n`;
-                            diagnosticReport += `   🕐 Time: ${isPast ? `${-minutesFromNow} min ago` : `In ${minutesFromNow} min`}\n`;
-                            diagnosticReport += `   🆔 ID: ${notif.id}\n`;
-                            diagnosticReport += `   📱 Medicine: ${notif.extra?.medicineName || 'Unknown'}\n`;
-                            diagnosticReport += `   🔔 Type: ${notif.extra?.alertType || 'Unknown'}\n\n`;
-                          });
-
-                          // Check for immediate triggers (notifications scheduled within next 2 minutes)
-                          const immediateTriggers = pending.notifications.filter(notif => {
-                            const scheduleTime = new Date(notif.schedule?.at || 0);
-                            const timeDiff = scheduleTime.getTime() - now.getTime();
-                            return timeDiff >= 0 && timeDiff <= 2 * 60 * 1000; // Next 2 minutes
-                          });
-
-                          if (immediateTriggers.length > 0) {
-                            diagnosticReport += `⚠️ IMMEDIATE TRIGGERS (Next 2 minutes):\n`;
-                            immediateTriggers.forEach(notif => {
-                              const scheduleTime = new Date(notif.schedule.at);
-                              diagnosticReport += `• ${notif.title} at ${scheduleTime.toLocaleTimeString()}\n`;
-                            });
-                            diagnosticReport += `\n`;
-                          }
-
-                          // Check for past notifications that should be cleaned
-                          const pastNotifications = pending.notifications.filter(notif => {
-                            const scheduleTime = new Date(notif.schedule?.at || 0);
-                            return scheduleTime < now;
-                          });
-
-                          if (pastNotifications.length > 0) {
-                            diagnosticReport += `🚨 PROBLEM FOUND: ${pastNotifications.length} past notifications!\n`;
-                            diagnosticReport += `These should have been cleaned up automatically.\n`;
-                            diagnosticReport += `This might be why alarms trigger immediately.\n\n`;
-                          }
-                        } else {
-                          diagnosticReport += `✅ No pending notifications found.\n`;
-                        }
-
-                        // Check medicines and their scheduling
-                        diagnosticReport += `💊 MEDICINE ANALYSIS:\n`;
-                        diagnosticReport += `Total medicines: ${medicines.length}\n`;
-
-                        medicines.forEach((med, index) => {
-                          const [hours, minutes] = med.alertTime.split(':');
-                          const todayAlarmTime = new Date(now);
-                          todayAlarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
-
-                          const timeDiff = todayAlarmTime.getTime() - now.getTime();
-                          const minutesFromNow = Math.round(timeDiff / (1000 * 60));
-
-                          diagnosticReport += `${index + 1}. ${med.name}\n`;
-                          diagnosticReport += `   ⏰ Alert Time: ${med.alertTime}\n`;
-                          diagnosticReport += `   📅 Today's Trigger: ${todayAlarmTime.toLocaleString()}\n`;
-                          diagnosticReport += `   🕐 Status: ${timeDiff < 0 ? `Passed ${-minutesFromNow} min ago` : `In ${minutesFromNow} min`}\n`;
-                          diagnosticReport += `   🔔 Type: ${med.alertType}\n\n`;
-                        });
-
-                        console.log(diagnosticReport);
-                        alert(diagnosticReport);
-
-                      } catch (error) {
-                        console.error('❌ Diagnostic error:', error);
-                        alert('Diagnostic failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors font-medium"
-                  >
-                    🔍 Full Notification Diagnostic
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🔬 RELIABILITY ANALYSIS - Checking notification consistency...');
-
-                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('❌ Analysis only available on Android device');
-                          return;
-                        }
-
-                        let analysisReport = `🔬 NOTIFICATION RELIABILITY ANALYSIS\n\n`;
-
-                        // Check Android version and permissions
-                        analysisReport += `📱 SYSTEM ANALYSIS:\n`;
-                        analysisReport += `Platform: ${await window.Capacitor.getPlatform()}\n`;
-
-                        // Check notification permissions
-                        const permissions = await LocalNotifications.checkPermissions();
-                        analysisReport += `Notification Permission: ${permissions.display}\n`;
-
-                        // Check battery optimization (common cause of inconsistent notifications)
-                        analysisReport += `\n⚡ BATTERY OPTIMIZATION CHECK:\n`;
-                        analysisReport += `Many Android devices kill apps in background to save battery.\n`;
-                        analysisReport += `This is the #1 cause of missing notifications!\n\n`;
-
-                        // Check notification channels
-                        analysisReport += `📺 NOTIFICATION CHANNELS:\n`;
-                        analysisReport += `• notification-channel: Regular notifications\n`;
-                        analysisReport += `• alarm-channel: Critical alarms\n\n`;
-
-                        // Analyze current medicines for potential issues
-                        analysisReport += `💊 MEDICINE RELIABILITY CHECK:\n`;
-
-                        let reliabilityIssues = 0;
-                        const now = new Date();
-
-                        medicines.forEach((med, index) => {
-                          const [hours, minutes] = med.alertTime.split(':');
-                          const todayAlarmTime = new Date(now);
-                          todayAlarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
-
-                          // Check for potential reliability issues
-                          let issues = [];
-
-                          // Issue 1: Alert time too close to current time
-                          const timeDiff = Math.abs(todayAlarmTime.getTime() - now.getTime());
-                          if (timeDiff < 5 * 60 * 1000) { // Less than 5 minutes
-                            issues.push('⚠️ Alert time very close to current time');
-                            reliabilityIssues++;
-                          }
-
-                          // Issue 2: Native alarm without proper setup
-                          if (med.alertType === 'native-alarm') {
-                            issues.push('🔊 Uses native alarm (requires special permissions)');
-                          }
-
-                          // Issue 3: Missing alert time
-                          if (!med.alertTime || med.alertTime === '') {
-                            issues.push('❌ Missing alert time');
-                            reliabilityIssues++;
-                          }
-
-                          analysisReport += `${index + 1}. ${med.name}\n`;
-                          analysisReport += `   Time: ${med.alertTime} (${med.alertType})\n`;
-                          if (issues.length > 0) {
-                            issues.forEach(issue => {
-                              analysisReport += `   ${issue}\n`;
-                            });
-                          } else {
-                            analysisReport += `   ✅ Configuration looks good\n`;
-                          }
-                          analysisReport += `\n`;
-                        });
-
-                        // Check for duplicate notification IDs (can cause conflicts)
-                        const pending = await LocalNotifications.getPending();
-                        const ids = pending.notifications?.map(n => n.id) || [];
-                        const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
-
-                        if (duplicateIds.length > 0) {
-                          analysisReport += `🚨 DUPLICATE NOTIFICATION IDS FOUND!\n`;
-                          analysisReport += `This can cause notifications to overwrite each other.\n`;
-                          analysisReport += `Duplicate IDs: ${duplicateIds.join(', ')}\n\n`;
-                          reliabilityIssues++;
-                        }
-
-                        // Overall reliability assessment
-                        analysisReport += `📊 RELIABILITY ASSESSMENT:\n`;
-                        if (reliabilityIssues === 0) {
-                          analysisReport += `✅ Configuration looks reliable!\n`;
-                          analysisReport += `If notifications still miss, check:\n`;
-                          analysisReport += `• Battery optimization settings\n`;
-                          analysisReport += `• Do Not Disturb mode\n`;
-                          analysisReport += `• App background restrictions\n`;
-                        } else {
-                          analysisReport += `⚠️ Found ${reliabilityIssues} potential reliability issues\n`;
-                          analysisReport += `These should be addressed for consistent notifications.\n`;
-                        }
-
-                        analysisReport += `\n🔧 COMMON SOLUTIONS:\n`;
-                        analysisReport += `1. Disable battery optimization for MyMedAlert\n`;
-                        analysisReport += `2. Enable "Allow background activity"\n`;
-                        analysisReport += `3. Add app to "Never sleeping apps"\n`;
-                        analysisReport += `4. Disable adaptive battery for this app\n`;
-                        analysisReport += `5. Set notification importance to HIGH\n`;
-
-                        console.log(analysisReport);
-                        alert(analysisReport);
-
-                      } catch (error) {
-                        console.error('❌ Analysis error:', error);
-                        alert('Analysis failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 transition-colors font-medium"
-                  >
-                    🔬 Reliability Analysis
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('🧪 NOTIFICATION CONSISTENCY TEST - Running comprehensive test suite...');
-
-                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('❌ Consistency test only available on Android device');
-                          return;
-                        }
-
-                        // Clear any existing test notifications first
-                        const pending = await LocalNotifications.getPending();
-                        const testNotifs = pending.notifications?.filter(n => n.extra?.isConsistencyTest) || [];
-                        if (testNotifs.length > 0) {
-                          console.log(`🧹 Clearing ${testNotifs.length} existing test notifications...`);
-                          await LocalNotifications.cancel({ notifications: testNotifs });
-                        }
-
-                        let testReport = `🧪 NOTIFICATION CONSISTENCY TEST\n\n`;
-                        testReport += `Starting comprehensive test suite...\n`;
-                        testReport += `This will schedule 5 test notifications at different intervals.\n\n`;
-
-                        const baseTime = Date.now();
-                        const testNotifications = [];
-
-                        // Test 1: Very short delay (30 seconds)
-                        testNotifications.push({
-                          title: '🧪 Test 1: Short Delay',
-                          body: 'This is test 1 - scheduled for 30 seconds',
-                          id: 99001,
-                          schedule: { at: new Date(baseTime + 30 * 1000) },
-                          channelId: 'notification-channel',
-                          importance: 4,
-                          priority: 1,
-                          sound: 'default',
-                          vibrate: [500],
-                          autoCancel: true,
-                          extra: {
-                            isConsistencyTest: true,
-                            testNumber: 1,
-                            testTime: new Date().toISOString(),
-                            scheduledFor: new Date(baseTime + 30 * 1000).toISOString()
-                          }
-                        });
-
-                        // Test 2: Medium delay (2 minutes)
-                        testNotifications.push({
-                          title: '🧪 Test 2: Medium Delay',
-                          body: 'This is test 2 - scheduled for 2 minutes',
-                          id: 99002,
-                          schedule: { at: new Date(baseTime + 2 * 60 * 1000) },
-                          channelId: 'notification-channel',
-                          importance: 4,
-                          priority: 1,
-                          sound: 'default',
-                          vibrate: [500],
-                          autoCancel: true,
-                          extra: {
-                            isConsistencyTest: true,
-                            testNumber: 2,
-                            testTime: new Date().toISOString(),
-                            scheduledFor: new Date(baseTime + 2 * 60 * 1000).toISOString()
-                          }
-                        });
-
-                        // Test 3: Long delay (5 minutes)
-                        testNotifications.push({
-                          title: '🧪 Test 3: Long Delay',
-                          body: 'This is test 3 - scheduled for 5 minutes',
-                          id: 99003,
-                          schedule: { at: new Date(baseTime + 5 * 60 * 1000) },
-                          channelId: 'notification-channel',
-                          importance: 4,
-                          priority: 1,
-                          sound: 'default',
-                          vibrate: [500],
-                          autoCancel: true,
-                          extra: {
-                            isConsistencyTest: true,
-                            testNumber: 3,
-                            testTime: new Date().toISOString(),
-                            scheduledFor: new Date(baseTime + 5 * 60 * 1000).toISOString()
-                          }
-                        });
-
-                        // Test 4: High priority alarm channel
-                        testNotifications.push({
-                          title: '🚨 Test 4: Alarm Channel',
-                          body: 'This is test 4 - using alarm channel (1 minute)',
-                          id: 99004,
-                          schedule: { at: new Date(baseTime + 1 * 60 * 1000) },
-                          channelId: 'alarm-channel',
-                          importance: 5,
-                          priority: 2,
-                          sound: 'default',
-                          vibrate: [1000, 500, 1000],
-                          autoCancel: true,
-                          extra: {
-                            isConsistencyTest: true,
-                            testNumber: 4,
-                            testTime: new Date().toISOString(),
-                            scheduledFor: new Date(baseTime + 1 * 60 * 1000).toISOString()
-                          }
-                        });
-
-                        // Test 5: Maximum settings test
-                        testNotifications.push({
-                          title: '🔥 Test 5: Maximum Settings',
-                          body: 'This is test 5 - all settings maxed (3 minutes)',
-                          id: 99005,
-                          schedule: { at: new Date(baseTime + 3 * 60 * 1000) },
-                          channelId: 'alarm-channel',
-                          importance: 5,
-                          priority: 2,
-                          sound: 'default',
-                          vibrate: [1000, 500, 1000, 500, 1000],
-                          lights: true,
-                          lightColor: '#FF0000',
-                          visibility: 1,
-                          autoCancel: true,
-                          wakeUpScreen: true,
-                          showWhen: true,
-                          when: baseTime + 3 * 60 * 1000,
-                          extra: {
-                            isConsistencyTest: true,
-                            testNumber: 5,
-                            testTime: new Date().toISOString(),
-                            scheduledFor: new Date(baseTime + 3 * 60 * 1000).toISOString(),
-                            alarmType: 'RTC_WAKEUP',
-                            exactAlarm: true,
-                            allowWhileIdle: true
-                          }
-                        });
-
-                        // Schedule all test notifications
-                        console.log('📤 Scheduling test notifications...');
-                        await LocalNotifications.schedule({
-                          notifications: testNotifications
-                        });
-
-                        testReport += `✅ Scheduled 5 test notifications:\n`;
-                        testReport += `• Test 1: 30 seconds (basic)\n`;
-                        testReport += `• Test 2: 2 minutes (medium)\n`;
-                        testReport += `• Test 3: 5 minutes (long)\n`;
-                        testReport += `• Test 4: 1 minute (alarm channel)\n`;
-                        testReport += `• Test 5: 3 minutes (maximum settings)\n\n`;
-
-                        testReport += `📊 WHAT TO WATCH FOR:\n`;
-                        testReport += `• Do all 5 notifications trigger?\n`;
-                        testReport += `• Are they triggered at the right times?\n`;
-                        testReport += `• Which ones (if any) fail to trigger?\n`;
-                        testReport += `• Does the alarm channel work better?\n\n`;
-
-                        testReport += `🔍 DEBUGGING TIPS:\n`;
-                        testReport += `1. Keep the app in foreground for first minute\n`;
-                        testReport += `2. Then put app in background\n`;
-                        testReport += `3. Note which notifications actually trigger\n`;
-                        testReport += `4. Use "Check Scheduled" to see what's pending\n\n`;
-
-                        testReport += `⏰ TIMELINE:\n`;
-                        testReport += `• ${new Date(baseTime + 30 * 1000).toLocaleTimeString()}: Test 1\n`;
-                        testReport += `• ${new Date(baseTime + 1 * 60 * 1000).toLocaleTimeString()}: Test 4\n`;
-                        testReport += `• ${new Date(baseTime + 2 * 60 * 1000).toLocaleTimeString()}: Test 2\n`;
-                        testReport += `• ${new Date(baseTime + 3 * 60 * 1000).toLocaleTimeString()}: Test 5\n`;
-                        testReport += `• ${new Date(baseTime + 5 * 60 * 1000).toLocaleTimeString()}: Test 3\n`;
-
-                        console.log(testReport);
-                        alert(testReport);
-
-                      } catch (error) {
-                        console.error('❌ Consistency test error:', error);
-                        alert('Consistency test failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors font-medium"
-                  >
-                    🧪 Run Consistency Test
-                  </button>
-
-                  <button
-                    onClick={async () => {
-                      try {
-                        console.log('📊 NOTIFICATION STATUS MONITOR - Real-time tracking...');
-
-                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('❌ Status monitor only available on Android device');
-                          return;
-                        }
-
-                        let statusReport = `📊 NOTIFICATION STATUS MONITOR\n\n`;
-
-                        // Current system status
-                        const now = new Date();
-                        statusReport += `⏰ Current Time: ${now.toLocaleString()}\n`;
-                        statusReport += `📱 Platform: Android (Native)\n\n`;
-
-                        // Check all pending notifications
-                        const pending = await LocalNotifications.getPending();
-                        const totalPending = pending.notifications?.length || 0;
-                        statusReport += `📋 PENDING NOTIFICATIONS: ${totalPending}\n\n`;
-
-                        if (totalPending > 0) {
-                          // Group by medicine
-                          const byMedicine = {};
-                          const byStatus = {
-                            upcoming: [],
-                            overdue: [],
-                            soon: [] // Within next 10 minutes
-                          };
-
-                          pending.notifications.forEach(notif => {
-                            const medicineName = notif.extra?.medicineName || 'Unknown';
-                            const scheduleTime = new Date(notif.schedule?.at || 0);
-                            const timeDiff = scheduleTime.getTime() - now.getTime();
-                            const minutesFromNow = Math.round(timeDiff / (1000 * 60));
-
-                            // Group by medicine
-                            if (!byMedicine[medicineName]) {
-                              byMedicine[medicineName] = [];
-                            }
-                            byMedicine[medicineName].push({
-                              ...notif,
-                              scheduleTime,
-                              minutesFromNow,
-                              isOverdue: timeDiff < 0
-                            });
-
-                            // Group by status
-                            if (timeDiff < 0) {
-                              byStatus.overdue.push({ ...notif, scheduleTime, minutesFromNow });
-                            } else if (timeDiff <= 10 * 60 * 1000) {
-                              byStatus.soon.push({ ...notif, scheduleTime, minutesFromNow });
-                            } else {
-                              byStatus.upcoming.push({ ...notif, scheduleTime, minutesFromNow });
-                            }
-                          });
-
-                          // Show overdue notifications (these are problems!)
-                          if (byStatus.overdue.length > 0) {
-                            statusReport += `🚨 OVERDUE NOTIFICATIONS (${byStatus.overdue.length}):\n`;
-                            byStatus.overdue.forEach((notif, index) => {
-                              statusReport += `${index + 1}. ${notif.title}\n`;
-                              statusReport += `   ⏰ Was due: ${notif.scheduleTime.toLocaleString()}\n`;
-                              statusReport += `   🕐 Overdue by: ${-notif.minutesFromNow} minutes\n`;
-                              statusReport += `   ❗ This should have been cleaned up!\n\n`;
-                            });
-                          }
-
-                          // Show upcoming notifications
-                          if (byStatus.soon.length > 0) {
-                            statusReport += `⏳ COMING SOON (Next 10 minutes):\n`;
-                            byStatus.soon.forEach((notif, index) => {
-                              statusReport += `${index + 1}. ${notif.title}\n`;
-                              statusReport += `   ⏰ Due: ${notif.scheduleTime.toLocaleString()}\n`;
-                              statusReport += `   🕐 In: ${notif.minutesFromNow} minutes\n\n`;
-                            });
-                          }
-
-                          // Show summary by medicine
-                          statusReport += `💊 BY MEDICINE:\n`;
-                          Object.entries(byMedicine).forEach(([medicine, notifs]) => {
-                            const overdueCount = notifs.filter(n => n.isOverdue).length;
-                            const upcomingCount = notifs.filter(n => !n.isOverdue).length;
-
-                            statusReport += `• ${medicine}: ${notifs.length} total`;
-                            if (overdueCount > 0) {
-                              statusReport += ` (⚠️ ${overdueCount} overdue)`;
-                            }
-                            statusReport += `\n`;
-
-                            // Show next notification for this medicine
-                            const nextNotif = notifs
-                              .filter(n => !n.isOverdue)
-                              .sort((a, b) => a.scheduleTime - b.scheduleTime)[0];
-
-                            if (nextNotif) {
-                              statusReport += `  Next: ${nextNotif.scheduleTime.toLocaleString()}\n`;
-                            }
-                          });
-
-                          statusReport += `\n`;
-                        } else {
-                          statusReport += `✅ No pending notifications found.\n`;
-                          statusReport += `This could mean:\n`;
-                          statusReport += `• No medicines are scheduled\n`;
-                          statusReport += `• All notifications are in the past\n`;
-                          statusReport += `• There was a scheduling failure\n\n`;
-                        }
-
-                        // Check medicine configuration
-                        statusReport += `💊 MEDICINE CONFIGURATION:\n`;
-                        statusReport += `Total medicines: ${medicines.length}\n`;
-
-                        if (medicines.length > 0) {
-                          medicines.forEach((med, index) => {
-                            const [hours, minutes] = med.alertTime.split(':');
-                            const todayAlarmTime = new Date(now);
-                            todayAlarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
-
-                            const timeDiff = todayAlarmTime.getTime() - now.getTime();
-                            const minutesFromNow = Math.round(timeDiff / (1000 * 60));
-
-                            statusReport += `${index + 1}. ${med.name}\n`;
-                            statusReport += `   Time: ${med.alertTime} (${med.alertType})\n`;
-                            statusReport += `   Today: ${timeDiff < 0 ? `Passed ${-minutesFromNow}m ago` : `In ${minutesFromNow}m`}\n`;
-
-                            // Check if there are pending notifications for this medicine
-                            const medicineNotifs = pending.notifications?.filter(n =>
-                              n.extra?.medicineId === med.id
-                            );
-                            statusReport += `   Scheduled: ${medicineNotifs?.length || 0} notifications\n\n`;
-                          });
-                        }
-
-                        // System health check
-                        statusReport += `🔧 SYSTEM HEALTH:\n`;
-                        const permissions = await LocalNotifications.checkPermissions();
-                        statusReport += `Notification Permission: ${permissions.display}\n`;
-
-                        // Check for common issues
-                        let healthIssues = 0;
-
-                        if (permissions.display !== 'granted') {
-                          statusReport += `❌ Notification permission not granted!\n`;
-                          healthIssues++;
-                        }
-
-                        if (medicines.length > 0 && totalPending === 0) {
-                          statusReport += `⚠️ No pending notifications despite having medicines!\n`;
-                          healthIssues++;
-                        }
-
-                        if (byStatus?.overdue?.length > 0) {
-                          statusReport += `⚠️ Overdue notifications found (cleanup needed)!\n`;
-                          healthIssues++;
-                        }
-
-                        if (healthIssues === 0) {
-                          statusReport += `✅ System appears healthy!\n`;
-                        } else {
-                          statusReport += `⚠️ Found ${healthIssues} potential issues.\n`;
-                        }
-
-                        console.log(statusReport);
-                        alert(statusReport);
-
-                      } catch (error) {
-                        console.error('❌ Status monitor error:', error);
-                        alert('Status monitor failed: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors font-medium"
-                  >
-                    📊 Notification Status Monitor
-                  </button>                  <div className="bg-blue-50 p-3 rounded-lg">
-                    <p className="text-sm text-blue-800">
-                      <strong>Current Medicines:</strong> {medicines.length}
-                    </p>
-                    <p className="text-xs text-blue-700 mt-1">
-                      Native alarms: {medicines.filter(m => m.alertType === 'native-alarm').length}
-                    </p>
-                    <p className="text-xs text-blue-700">
-                      Notifications: {medicines.filter(m => m.alertType === 'notification').length}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
               {/* Data Management */}
               <div className="bg-white rounded-xl shadow-sm p-4">
                 <h2 className="text-lg font-semibold text-gray-900 mb-4">Data Management</h2>
@@ -4789,307 +4164,6 @@ Click OK to continue.`;
                 </div>
               </div>
 
-              {/* Test Notifications - ENABLED FOR DEBUGGING */}
-              <div className="bg-white rounded-xl shadow-sm p-4">
-                <h2 className="text-lg font-semibold text-gray-900 mb-4">🚨 ALARM TESTING & DEBUGGING</h2>
-                <div className="space-y-3">
-                  <div className="bg-gradient-to-r from-red-800 to-red-900 p-4 rounded-lg border-2 border-red-600">
-                    <h3 className="text-white font-bold text-center mb-3">🔊 NATIVE ALARMS (REAL SOUND & WAKE DEVICE)</h3>
-                    <div className="space-y-2">
-                      <button
-                        onClick={createTestNativeAlarmMedicine}
-                        className="w-full p-3 bg-red-700 text-white rounded-lg hover:bg-red-800 transition-colors font-bold border-2 border-red-500"
-                      >
-                        🔥🚨 IMMEDIATE NATIVE ALARM (15 seconds) - WAKE DEVICE
-                      </button>
-                      <button
-                        onClick={async () => {
-                          try {
-                            console.log('🚨 QUICK ALARM TEST - 5 seconds');
-
-                            if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                              alert('Quick alarm test only works on Android devices.');
-                              return;
-                            }
-
-                            const now = new Date();
-                            const testTime = new Date(now.getTime() + 5000); // 5 seconds from now
-
-                            // Create quick test alarm config
-                            const quickAlarmConfig = {
-                              title: '🚨 QUICK ALARM TEST',
-                              body: 'Quick 5-second alarm test! This should work immediately!',
-                              id: 88888,
-                              schedule: { at: testTime },
-                              channelId: 'alarm-channel',
-                              importance: 5,
-                              priority: 2,
-                              sound: 'default',
-                              vibrate: [1000, 500, 1000],
-                              lights: true,
-                              lightColor: '#FF0000',
-                              autoCancel: false,
-                              wakeUpScreen: true,
-                              showWhen: true,
-                              when: testTime.getTime(),
-                              actions: [
-                                { id: 'dismiss', title: '✅ DISMISS', type: 'button' }
-                              ],
-                              extra: {
-                                isQuickTest: true,
-                                testTime: now.toISOString(),
-                                alarmType: 'RTC_WAKEUP',
-                                exactAlarm: true,
-                                allowWhileIdle: true
-                              }
-                            };
-
-                            await LocalNotifications.schedule({
-                              notifications: [quickAlarmConfig]
-                            });
-
-                            console.log('✅ Quick alarm scheduled for 5 seconds');
-                            alert('🚨 QUICK ALARM scheduled for 5 seconds!\n\nThis should:\n• Appear in exactly 5 seconds\n• Make alarm sound\n• Wake your device\n• Show dismiss button\n\nIf this works, your alarms are functional!');
-
-                          } catch (error) {
-                            console.error('❌ Quick alarm test error:', error);
-                            alert('Quick alarm test failed: ' + error.message);
-                          }
-                        }}
-                        className="w-full p-3 bg-orange-700 text-white rounded-lg hover:bg-orange-800 transition-colors font-bold border-2 border-orange-500"
-                      >
-                        ⚡ QUICK ALARM TEST (5 seconds) - INSTANT CHECK
-                      </button>
-                      <button
-                        onClick={testNativeAlarm}
-                        className="w-full p-3 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-bold border-2 border-red-400"
-                      >
-                        🚨🔊 TEST NATIVE ALARM (10 seconds) - REAL SOUND!
-                      </button>
-                      <button
-                        onClick={createTestNativeMedicine}
-                        className="w-full p-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors font-bold border-2 border-purple-400"
-                      >
-                        📝 CREATE TEST MEDICINE (2 mins) - NATIVE ALARM
-                      </button>
-                      <button
-                        onClick={createTestNotificationMedicine}
-                        className="w-full p-3 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors font-bold border-2 border-orange-400"
-                      >
-                        🔔 CREATE TEST NOTIFICATION (30s) - WITH DISMISS
-                      </button>
-                      <button
-                        onClick={testNativePlugin}
-                        className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium"
-                      >
-                        🔌 Test Native Plugin Connection
-                      </button>
-                      <button
-                        onClick={checkNativeAlarmPermission}
-                        className="w-full p-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium"
-                      >
-                        🔍 Check Native Alarm Permission
-                      </button>
-                      <button
-                        onClick={async () => {
-                          try {
-                            console.log('🚨 EMERGENCY ALARM TROUBLESHOOTING');
-
-                            let report = '🚨 EMERGENCY ALARM TROUBLESHOOTING REPORT\n\n';
-
-                            // Check basic setup
-                            report += '1️⃣ BASIC SETUP:\n';
-                            report += `• Total medicines: ${medicines.length}\n`;
-                            report += `• Medicines with alarms: ${medicines.filter(m => m.alertTime).length}\n`;
-                            report += `• Native alarms: ${medicines.filter(m => m.alertType === 'native-alarm').length}\n`;
-                            report += `• Regular notifications: ${medicines.filter(m => m.alertType === 'notification').length}\n\n`;
-
-                            // Check platform
-                            report += '2️⃣ PLATFORM CHECK:\n';
-                            report += `• Is Capacitor available: ${!!window.Capacitor}\n`;
-                            report += `• Is native platform: ${window.Capacitor ? window.Capacitor.isNativePlatform() : 'N/A'}\n`;
-                            report += `• LocalNotifications available: ${!!window.Capacitor?.Plugins?.LocalNotifications}\n`;
-                            report += `• MedicineAlarm plugin available: ${!!window.Capacitor?.Plugins?.MedicineAlarm}\n\n`;
-
-                            // Check permissions
-                            if (window.Capacitor && window.Capacitor.isNativePlatform()) {
-                              try {
-                                const permissions = await LocalNotifications.checkPermissions();
-                                report += '3️⃣ PERMISSIONS:\n';
-                                report += `• Display permission: ${permissions.display}\n`;
-                                report += `• Sound permission: ${permissions.sound || 'N/A'}\n\n`;
-                              } catch (permError) {
-                                report += '3️⃣ PERMISSIONS: ERROR - ' + permError.message + '\n\n';
-                              }
-
-                              // Check pending notifications
-                              try {
-                                const pending = await LocalNotifications.getPending();
-                                report += '4️⃣ PENDING NOTIFICATIONS:\n';
-                                report += `• Total pending: ${pending.notifications?.length || 0}\n`;
-
-                                if (pending.notifications?.length > 0) {
-                                  const now = new Date();
-                                  pending.notifications.slice(0, 3).forEach((notif, i) => {
-                                    const scheduleTime = new Date(notif.schedule?.at);
-                                    const timeDiff = (scheduleTime.getTime() - now.getTime()) / (1000 * 60);
-                                    report += `  ${i + 1}. ${notif.title} - ${timeDiff > 0 ? `in ${timeDiff.toFixed(1)} min` : `${-timeDiff.toFixed(1)} min ago`}\n`;
-                                  });
-                                }
-                                report += '\n';
-                              } catch (pendingError) {
-                                report += '4️⃣ PENDING NOTIFICATIONS: ERROR - ' + pendingError.message + '\n\n';
-                              }
-                            }
-
-                            // Check recent medicine
-                            const recentMedicine = medicines[medicines.length - 1];
-                            if (recentMedicine) {
-                              report += '5️⃣ LAST MEDICINE CHECK:\n';
-                              report += `• Name: ${recentMedicine.name}\n`;
-                              report += `• Alert time: ${recentMedicine.alertTime}\n`;
-                              report += `• Alert type: ${recentMedicine.alertType}\n`;
-                              report += `• Patient: ${recentMedicine.patientName}\n\n`;
-                            }
-
-                            report += '🔧 NEXT STEPS:\n';
-                            report += '1. Check Android Settings → Apps → MyMedAlert → Notifications\n';
-                            report += '2. Check Android Settings → Apps → Special access → Alarms & reminders\n';
-                            report += '3. Try creating a test medicine with immediate alert\n';
-                            report += '4. Use the diagnostic buttons below\n';
-
-                            console.log(report);
-                            alert(report);
-
-                          } catch (error) {
-                            console.error('❌ Troubleshooting error:', error);
-                            alert('Troubleshooting failed: ' + error.message);
-                          }
-                        }}
-                        className="w-full p-3 bg-red-800 text-white rounded-lg hover:bg-red-900 transition-colors font-bold border-2 border-red-600"
-                      >
-                        🚨🔧 EMERGENCY ALARM TROUBLESHOOTING
-                      </button>
-                      <button
-                        onClick={requestNativeAlarmPermission}
-                        className="w-full p-3 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors font-medium"
-                      >
-                        🚨 Request Native Exact Alarm Permission
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="bg-gray-100 p-4 rounded-lg">
-                    <h3 className="text-gray-800 font-bold text-center mb-3">📱 Capacitor Notification Tests</h3>
-                    <div className="space-y-2">
-                      <button
-                        onClick={testImmediateAlarm}
-                        className="w-full p-3 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
-                      >
-                        🚨 Test IMMEDIATE Alarm (5 seconds)
-                      </button>
-                      <button
-                        onClick={testSuperAlarm}
-                        className="w-full p-3 bg-red-800 text-white rounded-lg hover:bg-red-900 transition-colors font-medium"
-                      >
-                        🚨🚨 Test SUPER ALARM (3 seconds) - MAX POWER
-                      </button>
-                      <button
-                        onClick={testAlarmBarrage}
-                        className="w-full p-3 bg-red-900 text-white rounded-lg hover:bg-red-950 transition-colors font-medium"
-                      >
-                        🚨⚡ Test ALARM BARRAGE (5 rapid alarms)
-                      </button>
-                    </div>
-                  </div>
-                  <button
-                    onClick={runCompleteDiagnostic}
-                    className="w-full p-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors font-medium"
-                  >
-                    🩺 Run Complete Diagnostic
-                  </button>
-                  <button
-                    onClick={checkAndroidAlarmPermissions}
-                    className="w-full p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
-                  >
-                    🔍 Check Android Alarm Permissions
-                  </button>
-                  <button
-                    onClick={debugNativeAlarm}
-                    className="w-full p-3 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
-                  >
-                    🔍 DEBUG NATIVE ALARM (Step-by-Step)
-                  </button>
-                  <button
-                    onClick={troubleshootNativeAlarmImplementation}
-                    className="w-full p-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors font-medium"
-                  >
-                    📋 NATIVE ALARM IMPLEMENTATION GUIDE
-                  </button>
-                  <button
-                    onClick={requestExactAlarmPermission}
-                    className="w-full p-3 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors font-medium"
-                  >
-                    🚨 Request EXACT ALARM Permission
-                  </button>
-                  <button
-                    onClick={troubleshootAlarms}
-                    className="w-full p-3 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors font-medium"
-                  >
-                    🔧 ALARM TROUBLESHOOTING GUIDE
-                  </button>
-                  <button
-                    onClick={async () => {
-                      try {
-                        if ('Notification' in window) {
-                          const permission = await Notification.requestPermission();
-                          if (permission === 'granted') {
-                            new Notification('🧪 Test Notification', {
-                              body: 'This is a test notification from MyMedAlert!',
-                              icon: '/vite.svg',
-                              tag: 'test-notification'
-                            });
-                            alert('Test notification sent! Check your browser notifications.');
-                          } else {
-                            alert('Notification permission denied. Please enable notifications in your browser settings.');
-                          }
-                        } else {
-                          alert('Your browser does not support notifications.');
-                        }
-                      } catch (error) {
-                        alert('Error: ' + error.message);
-                      }
-                    }}
-                    className="w-full p-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors font-medium"
-                  >
-                    🧪 Test Browser Notification
-                  </button>
-                  <button
-                    onClick={() => {
-                      setTimeout(() => {
-                        if ('Notification' in window && Notification.permission === 'granted') {
-                          new Notification('💊 Test Medicine Reminder', {
-                            body: 'This is how your medicine reminders will look!',
-                            icon: '/vite.svg',
-                            tag: 'test-medicine',
-                            requireInteraction: true
-                          });
-                        }
-                      }, 3000);
-                      alert('Medicine reminder notification scheduled in 3 seconds!');
-                    }}
-                    className="w-full p-3 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors font-medium"
-                  >
-                    ⏰ Test 3-Second Reminder
-                  </button>
-                  <div className="bg-yellow-50 p-3 rounded-lg">
-                    <p className="text-sm text-yellow-800">
-                      <strong>Note:</strong> In the web version, notifications work as browser notifications.
-                      For mobile apps, use the native notification system.
-                    </p>
-                  </div>
-                </div>
-              </div>
 
               {/* About */}
               <div className="bg-white rounded-xl shadow-sm p-4">
@@ -5161,28 +4235,98 @@ Click OK to continue.`;
                   />
                 </div>
 
+                {/* Doctor Name (Optional) */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Doctor Name (Optional)
+                  </label>
+                  <div className="flex">
+                    <span className="inline-flex items-center px-3 py-3 border border-r-0 border-gray-300 bg-gray-100 text-gray-600 rounded-l-lg">
+                      Dr.
+                    </span>
+                    <input
+                      type="text"
+                      value={formData.doctorName ? formData.doctorName.replace(/^Dr\.?\s*/i, '') : ''}
+                      onChange={e => setFormData(prev => ({ ...prev, doctorName: e.target.value ? `Dr. ${e.target.value.replace(/^Dr\.?\s*/i, '')}` : '' }))}
+                      className="flex-1 px-4 py-3 border border-gray-300 rounded-r-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="Enter doctor's name"
+                    />
+                  </div>
+                </div>
+
+                {/* Item Type */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Item Type
+                  </label>
+                  <select
+                    value={formData.itemType}
+                    onChange={e => {
+                      const newItemType = e.target.value;
+                      setFormData(prev => ({
+                        ...prev,
+                        itemType: newItemType,
+                        // Auto-select 'other' dosage type when non-medicine is selected
+                        dosageType: newItemType === 'non-medicine' ? 'other' : prev.dosageType
+                      }));
+                    }}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  >
+                    <option value="medicine">💊 Medicine</option>
+                    <option value="non-medicine">📋 Non-Medicine (Food, Diaper, etc.)</option>
+                  </select>
+                </div>
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
                     Dosage
                   </label>
                   <div className="flex gap-2">
                     <input
-                      type="number"
-                      min="1"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
                       value={formData.dosage}
-                      onChange={e => setFormData(prev => ({ ...prev, dosage: parseInt(e.target.value) || 1 }))}
-                      className="w-24 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent appearance-auto"
+                      onChange={e => {
+                        const value = e.target.value;
+                        // Allow empty string or valid numbers
+                        if (value === '' || /^\d+$/.test(value)) {
+                          setFormData(prev => ({ ...prev, dosage: value }));
+                        }
+                      }}
+                      onBlur={e => {
+                        // Set minimum value of 1 on blur if empty
+                        if (e.target.value === '' || parseInt(e.target.value) < 1) {
+                          setFormData(prev => ({ ...prev, dosage: '1' }));
+                        }
+                      }}
+                      placeholder="1"
+                      className="w-24 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     />
                     <select
                       value={formData.dosageType}
-                      onChange={e => setFormData(prev => ({ ...prev, dosageType: e.target.value }))}
+                      onChange={e => setFormData(prev => ({ ...prev, dosageType: e.target.value, customDosageType: '' }))}
                       className="px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     >
                       <option value="tablet">Tablet</option>
                       <option value="ml">ml</option>
                       <option value="drop">Drop</option>
+                      <option value="inhaler">Inhaler Puff</option>
+                      <option value="injection">Injection</option>
+                      <option value="powder">Powder</option>
+                      <option value="other">Other</option>
                     </select>
                   </div>
+                  {/* Custom dosage type input when 'Other' is selected */}
+                  {formData.dosageType === 'other' && (
+                    <input
+                      type="text"
+                      value={formData.customDosageType}
+                      onChange={e => setFormData(prev => ({ ...prev, customDosageType: e.target.value }))}
+                      className="mt-2 w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="Enter dosage type (e.g., piece, serving, pack)"
+                    />
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
@@ -5362,9 +4506,102 @@ Click OK to continue.`;
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   >
                     <option value="daily">Daily</option>
+                    <option value="every-other-day">Every Other Day</option>
+                    <option value="every-n-days">Every N Days</option>
+                    <option value="specific-days">Specific Days of Week</option>
                     <option value="weekly">Weekly</option>
                     <option value="monthly">Monthly</option>
+                    <option value="as-needed">As Needed</option>
                   </select>
+
+                  {/* Every N Days Input */}
+                  {formData.frequency === 'every-n-days' && (
+                    <div className="mt-3">
+                      <label className="block text-sm font-medium text-gray-600 mb-1">
+                        Every how many days?
+                      </label>
+                      <input
+                        type="number"
+                        min="2"
+                        max="30"
+                        value={formData.frequencyDays}
+                        onChange={(e) => setFormData(prev => ({ ...prev, frequencyDays: parseInt(e.target.value) || 2 }))}
+                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="e.g., 3 for every 3 days"
+                      />
+                    </div>
+                  )}
+
+                  {/* Specific Days of Week Checkboxes */}
+                  {formData.frequency === 'specific-days' && (
+                    <div className="mt-3">
+                      <label className="block text-sm font-medium text-gray-600 mb-2">
+                        Select days of the week
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day, index) => (
+                          <label
+                            key={day}
+                            className={`flex items-center justify-center w-12 h-10 rounded-lg cursor-pointer border-2 transition-all ${
+                              formData.specificWeekDays.includes(index)
+                                ? 'bg-blue-500 border-blue-500 text-white'
+                                : 'bg-gray-100 border-gray-300 text-gray-700 hover:border-blue-300'
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              className="hidden"
+                              checked={formData.specificWeekDays.includes(index)}
+                              onChange={(e) => {
+                                setFormData(prev => ({
+                                  ...prev,
+                                  specificWeekDays: e.target.checked
+                                    ? [...prev.specificWeekDays, index]
+                                    : prev.specificWeekDays.filter(d => d !== index)
+                                }));
+                              }}
+                            />
+                            <span className="text-sm font-medium">{day}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Reminder End Date */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Reminder Till Date (Optional)
+                  </label>
+                  <div className="space-y-2">
+                    <input
+                      type="date"
+                      value={formData.reminderEndDate}
+                      onChange={(e) => {
+                        const endDate = e.target.value;
+                        const days = calculateDaysFromEndDate(endDate);
+                        setFormData(prev => ({ ...prev, reminderEndDate: endDate, reminderDurationDays: days }));
+                      }}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      min={new Date().toISOString().split('T')[0]}
+                    />
+                    <p className="text-xs text-gray-500">Or specify duration in days:</p>
+                    <input
+                      type="number"
+                      min="1"
+                      max="365"
+                      value={formData.reminderDurationDays}
+                      onChange={(e) => {
+                        const days = e.target.value;
+                        const endDate = calculateEndDateFromDays(days);
+                        setFormData(prev => ({ ...prev, reminderDurationDays: days, reminderEndDate: endDate }));
+                      }}
+                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="Number of days (e.g., 30)"
+                    />
+                    <p className="text-xs text-gray-400">Leave empty for indefinite reminders</p>
+                  </div>
                 </div>
 
                 <div>
@@ -5425,7 +4662,7 @@ Click OK to continue.`;
                     onChange={(e) => setFormData(prev => ({ ...prev, notes: e.target.value }))}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
                     rows="3"
-                    placeholder="Additional notes or instructions"
+                    placeholder="Additional notes or instructions (like for what you are taking this Medicine)"
                   />
                 </div>
 
@@ -5578,106 +4815,238 @@ Click OK to continue.`;
         </div>
       )}
 
-      {/* Sharing Dialog */}
+      {/* Sharing Dialog - Enhanced with medicine selection */}
       {showSharingDialog && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg max-w-md w-full p-6">
-            <div className="flex justify-between items-center mb-4">
+          <div className="bg-white rounded-lg max-w-lg w-full max-h-[90vh] overflow-hidden flex flex-col">
+            <div className="flex justify-between items-center p-4 border-b">
               <h3 className="text-lg font-semibold text-gray-900">Share Medicine List</h3>
               <button
-                onClick={() => setShowSharingDialog(false)}
+                onClick={() => {
+                  setShowSharingDialog(false);
+                  setShareSelection({});
+                }}
                 className="text-gray-400 hover:text-gray-600"
               >
                 <X className="h-6 w-6" />
               </button>
             </div>
 
-            <div className="mb-4">
-              <p className="text-sm text-gray-600 mb-3">Choose how to share your medicine list:</p>
+            <div className="flex-1 overflow-y-auto p-4">
+              {/* Select/Deselect All */}
+              <div className="flex justify-between items-center mb-3">
+                <p className="text-sm font-medium text-gray-700">Select medicines to share:</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => {
+                      const allSelected = {};
+                      medicines.forEach(med => { allSelected[med.id] = true; });
+                      setShareSelection(allSelected);
+                    }}
+                    className="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
+                  >
+                    Select All
+                  </button>
+                  <button
+                    onClick={() => setShareSelection({})}
+                    className="text-xs px-2 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200"
+                  >
+                    Deselect All
+                  </button>
+                </div>
+              </div>
 
-              <div className="space-y-3">
+              {/* Group by Patient and Time Slot */}
+              {(() => {
+                // Group medicines by patient
+                const patientGroups = {};
+                medicines.forEach(med => {
+                  const patient = med.patientName || 'General';
+                  if (!patientGroups[patient]) {
+                    patientGroups[patient] = { morning: [], afternoon: [], evening: [], night: [] };
+                  }
+                  patientGroups[patient][med.time]?.push(med);
+                });
+
+                return Object.entries(patientGroups).map(([patient, timeGroups]) => (
+                  <div key={patient} className="mb-4 border rounded-lg overflow-hidden">
+                    <div className="bg-gray-100 px-3 py-2 font-medium text-gray-800 flex justify-between items-center">
+                      <span>👤 {patient}</span>
+                      <button
+                        onClick={() => {
+                          const patientMeds = medicines.filter(m => (m.patientName || 'General') === patient);
+                          const allSelected = patientMeds.every(m => shareSelection[m.id]);
+                          const newSelection = { ...shareSelection };
+                          patientMeds.forEach(m => { newSelection[m.id] = !allSelected; });
+                          setShareSelection(newSelection);
+                        }}
+                        className="text-xs px-2 py-1 bg-white text-gray-600 rounded hover:bg-gray-200"
+                      >
+                        Toggle All
+                      </button>
+                    </div>
+                    
+                    {['morning', 'afternoon', 'evening', 'night'].map(timeSlot => {
+                      const medsInSlot = timeGroups[timeSlot];
+                      if (!medsInSlot || medsInSlot.length === 0) return null;
+                      
+                      return (
+                        <div key={timeSlot} className="border-t">
+                          <div className="bg-gray-50 px-3 py-1.5 text-sm text-gray-600 flex items-center">
+                            <span className="mr-2">{timeSlots[timeSlot]?.icon}</span>
+                            <span>{timeSlots[timeSlot]?.label}</span>
+                          </div>
+                          {medsInSlot.map(med => {
+                            const dosageTypeDisplay = med.dosageType === 'other' ? (med.customDosageType || 'unit') : med.dosageType;
+                            const stockNeeded = med.reminderEndDate ? (() => {
+                              const today = new Date();
+                              today.setHours(0, 0, 0, 0);
+                              const endDate = new Date(med.reminderEndDate);
+                              endDate.setHours(0, 0, 0, 0);
+                              if (endDate <= today) return null;
+                              const daysRemaining = Math.ceil((endDate - today) / (1000 * 60 * 60 * 24));
+                              const dosagePerDay = parseInt(med.dosage) || 1;
+                              return daysRemaining * dosagePerDay;
+                            })() : null;
+                            
+                            return (
+                            <label
+                              key={med.id}
+                              className="flex items-start px-3 py-2 hover:bg-blue-50 cursor-pointer border-t border-gray-100"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={shareSelection[med.id] || false}
+                                onChange={(e) => setShareSelection(prev => ({
+                                  ...prev,
+                                  [med.id]: e.target.checked
+                                }))}
+                                className="w-4 h-4 mt-1 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                              />
+                              <div className="ml-3 flex-1">
+                                <div className="text-sm font-medium text-gray-900">
+                                  {med.itemType === 'non-medicine' ? '📋' : '💊'} {med.name}
+                                </div>
+                                <div className="text-xs text-gray-500">
+                                  {med.dosage} {dosageTypeDisplay} • {med.specificTime}
+                                </div>
+                                {med.doctorName && (
+                                  <div className="text-xs text-purple-600">👨‍⚕️ {med.doctorName}</div>
+                                )}
+                                {med.itemType !== 'non-medicine' && (
+                                  <div className="text-xs text-gray-500">
+                                    📦 Stock: {med.currentPills}/{med.totalPills}
+                                    {stockNeeded !== null && (
+                                      <span className={stockNeeded > med.currentPills ? ' text-red-500' : ' text-green-600'}>
+                                        {' '}• Need: {stockNeeded} (till {med.reminderEndDate})
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                                {med.notes && (
+                                  <div className="text-xs text-gray-400 italic">📝 {med.notes}</div>
+                                )}
+                              </div>
+                            </label>
+                          );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ));
+              })()}
+
+              {medicines.length === 0 && (
+                <p className="text-center text-gray-500 py-4">No medicines to share</p>
+              )}
+            </div>
+
+            {/* Share Methods */}
+            <div className="border-t p-4">
+              <p className="text-sm text-gray-600 mb-3">
+                Share {Object.values(shareSelection).filter(Boolean).length} selected item(s) via:
+              </p>
+              <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={() => {
-                    const message = generateMedicineList();
+                    const selectedMeds = medicines.filter(m => shareSelection[m.id]);
+                    if (selectedMeds.length === 0) {
+                      alert('Please select at least one medicine to share');
+                      return;
+                    }
+                    const message = generateSelectedMedicineList(selectedMeds);
                     const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(message)}`;
                     window.open(whatsappUrl, '_blank');
                     setShowSharingDialog(false);
+                    setShareSelection({});
                   }}
-                  className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-green-600 text-white rounded-md hover:bg-green-700"
+                  disabled={Object.values(shareSelection).filter(Boolean).length === 0}
+                  className="flex items-center justify-center space-x-1 px-3 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
                 >
-                  <MessageCircle className="h-5 w-5" />
-                  <span>Share via WhatsApp</span>
+                  <MessageCircle className="h-4 w-4" />
+                  <span>WhatsApp</span>
                 </button>
 
                 <button
                   onClick={() => {
-                    const message = generateMedicineList();
-                    const smsUrl = `sms:?body=${encodeURIComponent(message)}`;
-                    window.location.href = smsUrl;
+                    const selectedMeds = medicines.filter(m => shareSelection[m.id]);
+                    if (selectedMeds.length === 0) {
+                      alert('Please select at least one medicine to share');
+                      return;
+                    }
+                    const message = generateSelectedMedicineList(selectedMeds);
+                    window.location.href = `sms:?body=${encodeURIComponent(message)}`;
                     setShowSharingDialog(false);
+                    setShareSelection({});
                   }}
-                  className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                  disabled={Object.values(shareSelection).filter(Boolean).length === 0}
+                  className="flex items-center justify-center space-x-1 px-3 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
                 >
-                  <MessageSquare className="h-5 w-5" />
-                  <span>Share via SMS</span>
+                  <MessageSquare className="h-4 w-4" />
+                  <span>SMS</span>
                 </button>
 
                 <button
                   onClick={() => {
-                    const message = generateMedicineList();
-                    const emailUrl = `mailto:?subject=${encodeURIComponent('My Medicine List')}&body=${encodeURIComponent(message)}`;
-                    window.location.href = emailUrl;
+                    const selectedMeds = medicines.filter(m => shareSelection[m.id]);
+                    if (selectedMeds.length === 0) {
+                      alert('Please select at least one medicine to share');
+                      return;
+                    }
+                    const message = generateSelectedMedicineList(selectedMeds);
+                    window.location.href = `mailto:?subject=${encodeURIComponent('Medicine Schedule')}&body=${encodeURIComponent(message)}`;
                     setShowSharingDialog(false);
+                    setShareSelection({});
                   }}
-                  className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-purple-600 text-white rounded-md hover:bg-purple-700"
+                  disabled={Object.values(shareSelection).filter(Boolean).length === 0}
+                  className="flex items-center justify-center space-x-1 px-3 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
                 >
-                  <Mail className="h-5 w-5" />
-                  <span>Share via Email</span>
+                  <Mail className="h-4 w-4" />
+                  <span>Email</span>
                 </button>
 
                 <button
                   onClick={() => {
-                    const message = generateMedicineList();
+                    const selectedMeds = medicines.filter(m => shareSelection[m.id]);
+                    if (selectedMeds.length === 0) {
+                      alert('Please select at least one medicine to share');
+                      return;
+                    }
+                    const message = generateSelectedMedicineList(selectedMeds);
                     navigator.clipboard.writeText(message);
+                    alert('Medicine list copied to clipboard!');
                     setShowSharingDialog(false);
-                    // You might want to show a toast notification here
+                    setShareSelection({});
                   }}
-                  className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-gray-600 text-white rounded-md hover:bg-gray-700"
+                  disabled={Object.values(shareSelection).filter(Boolean).length === 0}
+                  className="flex items-center justify-center space-x-1 px-3 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
                 >
-                  <Copy className="h-5 w-5" />
-                  <span>Copy to Clipboard</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    const message = generateMedicineList();
-                    const printWindow = window.open('', '_blank');
-                    printWindow.document.write(`
-                      <html>
-                        <head><title>Medicine List</title></head>
-                        <body style="font-family: Arial, sans-serif; padding: 20px;">
-                          <pre style="white-space: pre-wrap;">${message}</pre>
-                        </body>
-                      </html>
-                    `);
-                    printWindow.document.close();
-                    printWindow.print();
-                    setShowSharingDialog(false);
-                  }}
-                  className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
-                >
-                  <Printer className="h-5 w-5" />
-                  <span>Print</span>
+                  <Copy className="h-4 w-4" />
+                  <span>Copy</span>
                 </button>
               </div>
             </div>
-
-            <button
-              onClick={() => setShowSharingDialog(false)}
-              className="w-full px-4 py-2 text-gray-600 bg-gray-100 rounded-md hover:bg-gray-200"
-            >
-              Cancel
-            </button>
           </div>
         </div>
       )}

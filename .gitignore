@@ -54,3 +54,8 @@ ehthumbs.db
 coverage/
 *.lcov
 .nyc_output
+
+# Keystore files (IMPORTANT: Never commit these)
+*.jks
+*.keystore
+keystore.properties
