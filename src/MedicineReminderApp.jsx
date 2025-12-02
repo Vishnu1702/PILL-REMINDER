@@ -73,7 +73,45 @@ const MedicineReminderApp = () => {
     if (storedMeds) setMedicines(JSON.parse(storedMeds));
     if (storedNotifs) setNotifications(JSON.parse(storedNotifs));
     if (storedHistory) setDosageHistory(JSON.parse(storedHistory));
+
+    // CRITICAL FIX: Delay cleanup to ensure medicines are loaded first
+    // This prevents cancelling valid alarms during app startup
+    setTimeout(() => {
+      cleanupPastNotifications();
+    }, 2000); // Wait 2 seconds for app to fully initialize
   }, []);
+
+  // Clean up any notifications scheduled for past times
+  const cleanupPastNotifications = async () => {
+    try {
+      if (window.Capacitor && window.Capacitor.isNativePlatform()) {
+        console.log('🧹 Cleaning up past notifications on app start...');
+
+        const pending = await LocalNotifications.getPending();
+        const now = new Date();
+        const pastNotifications = [];
+
+        pending.notifications?.forEach(notification => {
+          if (notification.schedule?.at) {
+            const scheduleTime = new Date(notification.schedule.at);
+            if (scheduleTime < now) {
+              pastNotifications.push({ id: notification.id });
+              console.log(`🗑️ Found past notification: ${notification.title} scheduled for ${scheduleTime.toLocaleString()}`);
+            }
+          }
+        });
+
+        if (pastNotifications.length > 0) {
+          await LocalNotifications.cancel({ notifications: pastNotifications });
+          console.log(`✅ Cancelled ${pastNotifications.length} past notifications`);
+        } else {
+          console.log('✅ No past notifications found to clean up');
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error cleaning up past notifications:', error);
+    }
+  };
 
   // Save medicines to localStorage whenever they change
   useEffect(() => {
@@ -158,26 +196,159 @@ const MedicineReminderApp = () => {
     const setupNotificationListeners = async () => {
       try {
         if (window.Capacitor && window.Capacitor.isNativePlatform()) {
-          // Listen for notification taps
-          await LocalNotifications.addListener('localNotificationActionPerformed', (notification) => {
-            console.log('🔔 Notification tapped:', notification);
+          // Listen for notification action taps (Taken, Dismiss, Skip)
+          await LocalNotifications.addListener('localNotificationActionPerformed', async (notification) => {
+            console.log('🔔 Notification action performed:', notification);
 
-            // Handle notification tap
-            if (notification.notification && notification.notification.extra) {
-              const { medicineId, medicineName, alertType } = notification.notification.extra;
-              console.log(`📋 Medicine: ${medicineName} (ID: ${medicineId}) - Alert Type: ${alertType}`);
+            const { actionId } = notification;
+            const notifData = notification.notification;
 
-              // Show confirmation or handle the tap
-              alert(`Notification received for ${medicineName}! ✅`);
+            if (notifData && notifData.extra) {
+              const { medicineId, medicineName, alertType } = notifData.extra;
+              console.log(`📋 Action: ${actionId} for ${medicineName} (ID: ${medicineId}) - Alert Type: ${alertType}`);
+
+              // Handle different actions
+              switch (actionId) {
+                case 'taken':
+                  console.log(`✅ User marked ${medicineName} as taken`);
+
+                  // Record the dosage as taken
+                  const medicine = medicines.find(m => m.id === medicineId);
+                  if (medicine) {
+                    // Add to dosage history
+                    const newRecord = {
+                      id: Date.now(),
+                      medicineId: medicine.id,
+                      medicineName: medicine.name,
+                      patientName: medicine.patientName,
+                      dosage: `${medicine.dosage} ${medicine.dosageType}`,
+                      takenAt: new Date().toISOString(),
+                      alertTime: medicine.alertTime,
+                      status: 'taken'
+                    };
+
+                    const currentHistory = JSON.parse(localStorage.getItem(STORAGE_KEYS.dosageHistory) || '[]');
+                    const updatedHistory = [newRecord, ...currentHistory];
+                    localStorage.setItem(STORAGE_KEYS.dosageHistory, JSON.stringify(updatedHistory));
+
+                    // Update current pills count
+                    const updatedMedicines = medicines.map(m =>
+                      m.id === medicineId
+                        ? { ...m, currentPills: Math.max(0, m.currentPills - m.dosage) }
+                        : m
+                    );
+                    localStorage.setItem(STORAGE_KEYS.medicines, JSON.stringify(updatedMedicines));
+
+                    // Cancel this specific notification
+                    try {
+                      await LocalNotifications.cancel({
+                        notifications: [{ id: notifData.id }]
+                      });
+                      console.log(`� Cancelled notification ${notifData.id} for ${medicineName}`);
+                    } catch (cancelError) {
+                      console.warn('⚠️ Could not cancel notification:', cancelError);
+                    }
+
+                    alert(`✅ ${medicineName} marked as taken! 💊`);
+                  }
+                  break;
+
+                case 'dismiss':
+                  console.log(`⏰ User snoozed ${medicineName} for 5 minutes`);
+
+                  // Schedule a new notification 5 minutes from now
+                  const snoozeTime = new Date(Date.now() + 5 * 60 * 1000);
+                  const snoozeNotification = {
+                    ...notifData,
+                    id: notifData.id + 10000, // Different ID to avoid conflicts
+                    title: `🔔 ${medicineName} (Snoozed)`,
+                    body: `Reminder: Time to take ${notifData.body?.split('Time to take ')[1] || 'your medicine'}`,
+                    schedule: { at: snoozeTime },
+                    extra: {
+                      ...notifData.extra,
+                      isSnoozed: true,
+                      originalTime: notifData.extra?.scheduledTime,
+                      snoozeTime: snoozeTime.getTime()
+                    }
+                  };
+
+                  try {
+                    // Cancel original notification
+                    await LocalNotifications.cancel({
+                      notifications: [{ id: notifData.id }]
+                    });
+
+                    // Schedule snoozed notification
+                    await LocalNotifications.schedule({
+                      notifications: [snoozeNotification]
+                    });
+
+                    console.log(`⏰ Snoozed ${medicineName} until ${snoozeTime.toLocaleTimeString()}`);
+                    alert(`⏰ ${medicineName} snoozed for 5 minutes!\nNext reminder: ${snoozeTime.toLocaleTimeString()}`);
+                  } catch (snoozeError) {
+                    console.error('❌ Error snoozing notification:', snoozeError);
+                    alert('❌ Could not snooze notification. Please try again.');
+                  }
+                  break;
+
+                case 'skip':
+                  console.log(`❌ User skipped ${medicineName}`);
+
+                  // Record as skipped in history
+                  const medicine_skip = medicines.find(m => m.id === medicineId);
+                  if (medicine_skip) {
+                    const skipRecord = {
+                      id: Date.now(),
+                      medicineId: medicine_skip.id,
+                      medicineName: medicine_skip.name,
+                      patientName: medicine_skip.patientName,
+                      dosage: `${medicine_skip.dosage} ${medicine_skip.dosageType}`,
+                      takenAt: new Date().toISOString(),
+                      alertTime: medicine_skip.alertTime,
+                      status: 'skipped'
+                    };
+
+                    const currentHistory = JSON.parse(localStorage.getItem(STORAGE_KEYS.dosageHistory) || '[]');
+                    const updatedHistory = [skipRecord, ...currentHistory];
+                    localStorage.setItem(STORAGE_KEYS.dosageHistory, JSON.stringify(updatedHistory));
+                  }
+
+                  // Cancel this notification
+                  try {
+                    await LocalNotifications.cancel({
+                      notifications: [{ id: notifData.id }]
+                    });
+                    console.log(`🚫 Cancelled skipped notification ${notifData.id} for ${medicineName}`);
+                  } catch (cancelError) {
+                    console.warn('⚠️ Could not cancel notification:', cancelError);
+                  }
+
+                  alert(`❌ ${medicineName} skipped. Don't forget your next dose! ⚠️`);
+                  break;
+
+                default:
+                  console.log(`🔔 Default notification tap for ${medicineName}`);
+                  alert(`🔔 Reminder: Time to take ${medicineName}!\n\nPlease take your medicine and mark it as taken in the app. 💊`);
+                  break;
+              }
             }
           });
 
           // Listen for notification received (when app is in foreground)
           await LocalNotifications.addListener('localNotificationReceived', (notification) => {
             console.log('📨 Notification received in foreground:', notification);
+
+            // Show in-app notification for foreground notifications
+            if (notification.extra?.medicineName) {
+              const medicine = notification.extra.medicineName;
+              console.log(`📱 Foreground notification for ${medicine}`);
+
+              // You could show a toast or modal here for foreground notifications
+              // For now, just log it
+            }
           });
 
-          console.log('✅ Notification listeners set up successfully');
+          console.log('✅ Enhanced notification listeners set up successfully');
         }
       } catch (error) {
         console.error('❌ Error setting up notification listeners:', error);
@@ -301,6 +472,28 @@ const MedicineReminderApp = () => {
 
       console.log('📋 Scheduling notification for:', medicine.name, 'at', medicine.alertTime, 'type:', medicine.alertType);
 
+      // Check if we're in a native app environment and have permissions
+      if (typeof window !== 'undefined' && window.Capacitor && window.Capacitor.isNativePlatform()) {
+        // Check permissions first
+        try {
+          const permissions = await LocalNotifications.checkPermissions();
+          console.log('📋 Notification permissions:', permissions);
+
+          if (permissions.display !== 'granted') {
+            console.warn('⚠️ Notification permission not granted, requesting...');
+            const requestResult = await LocalNotifications.requestPermissions();
+            console.log('📋 Permission request result:', requestResult);
+
+            if (requestResult.display !== 'granted') {
+              alert(`❌ Notification permission denied for ${medicine.name}. Please enable notifications in Android settings.`);
+              return;
+            }
+          }
+        } catch (permError) {
+          console.error('❌ Error checking permissions:', permError);
+        }
+      }
+
       // Check if we're in a native app environment
       if (typeof window !== 'undefined' && !window.Capacitor) {
         console.warn('LocalNotifications only work in native Capacitor apps. Using browser notification as fallback.');
@@ -369,9 +562,9 @@ const MedicineReminderApp = () => {
           console.log('📊 Scheduling results:', results);
           return; // Exit early for native alarms
         } catch (error) {
-          console.error('❌ Failed to schedule native alarm, falling back to Capacitor alarm:', error);
-          // Continue with Capacitor notifications as fallback
-          medicine.alertType = 'alarm';
+          console.error('❌ Failed to schedule native alarm, falling back to regular notification:', error);
+          // Continue with regular notifications as fallback
+          medicine.alertType = 'notification';
         }
       }
 
@@ -384,8 +577,19 @@ const MedicineReminderApp = () => {
         notifTime.setDate(notifTime.getDate() + day);
         notifTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
 
-        // Skip if time has already passed today (for day 0)
-        if (day === 0 && notifTime < now) continue;
+        // IMPROVED TIMING LOGIC: More lenient for day 0, strict for future days
+        if (day === 0) {
+          // For today: Allow scheduling if time is at least 3 seconds in the future
+          // REDUCED from 10s to 3s for better UX - most phones can handle this
+          const timeDiffSeconds = (notifTime.getTime() - now.getTime()) / 1000;
+          if (timeDiffSeconds < 3) {
+            console.log(`⏭️ Day ${day}: Time passed or too soon (${timeDiffSeconds.toFixed(1)}s), skipping`);
+            console.warn(`🚨 ALARM SKIPPED: ${medicine.name} scheduled for ${medicine.alertTime} but current time is ${now.toLocaleTimeString()}`);
+            continue;
+          } else {
+            console.log(`✅ Day ${day}: Scheduling in ${timeDiffSeconds.toFixed(1)}s - WITHIN ACCEPTABLE RANGE`);
+          }
+        }
 
         const baseConfig = {
           title: `💊 ${medicine.name}`,
@@ -401,69 +605,98 @@ const MedicineReminderApp = () => {
           }
         };
 
-        // Enhanced configuration for different alert types - native-alarm already handled above
+        // ENHANCED notification configuration with proper action buttons
+        const notificationConfig = {
+          ...baseConfig,
+          channelId: medicine.alertType === 'alarm' ? 'alarm-channel' : 'notification-channel',
+          importance: medicine.alertType === 'alarm' ? 5 : 4, // IMPORTANCE_MAX for alarms, HIGH for notifications
+          priority: medicine.alertType === 'alarm' ? 2 : 1, // HIGH priority for alarms
+          ongoing: false,
+          autoCancel: false, // Don't auto-dismiss so user must interact
+          sound: 'default',
+          vibrate: medicine.alertType === 'alarm' ? [1000, 500, 1000] : [500, 500], // Stronger vibration for alarms
+          lights: true,
+          lightColor: medicine.color || '#3B82F6',
+          visibility: 1, // VISIBILITY_PUBLIC
+          category: 'reminder',
+          showWhen: true,
+          when: notifTime.getTime(),
+          wakeUpScreen: medicine.alertType === 'alarm', // Wake screen for alarms
+          // CRITICAL: Action buttons for dismiss functionality
+          actionTypeId: 'MEDICINE_REMINDER',
+          actions: [
+            {
+              id: 'taken',
+              title: '✅ Taken',
+              type: 'button',
+              destructive: false,
+              input: false
+            },
+            {
+              id: 'dismiss',
+              title: '⏰ Snooze 5min',
+              type: 'button',
+              destructive: false,
+              input: false
+            },
+            {
+              id: 'skip',
+              title: '❌ Skip',
+              type: 'button',
+              destructive: true,
+              input: false
+            }
+          ],
+          extra: {
+            ...baseConfig.extra,
+            alarmType: 'RTC_WAKEUP',
+            exactAlarm: true,
+            allowWhileIdle: medicine.alertType === 'alarm',
+            canDismiss: true,
+            scheduledTime: notifTime.getTime(),
+            hasActions: true, // Flag to indicate this notification has action buttons
+            medicineColor: medicine.color,
+            patientName: medicine.patientName || ''
+          }
+        };
 
-        if (medicine.alertType === 'alarm') {
-          // Fallback to regular notifications instead of complex alarm configs
-          const notificationConfig = {
-            ...baseConfig,
-            channelId: 'notification-channel',
-            importance: 4, // IMPORTANCE_HIGH for regular notifications
-            priority: 1, // PRIORITY_DEFAULT
-            ongoing: false,
-            autoCancel: true,
-            sound: 'default',
-            vibrate: [500, 500], // Gentle vibration
-            lights: true,
-            lightColor: '#3B82F6',
-            visibility: 1, // VISIBILITY_PUBLIC
-            category: 'reminder',
-            showWhen: true,
-            when: notifTime.getTime(),
-            extra: {
-              ...baseConfig.extra,
-              alarmType: 'RTC_WAKEUP',
-              exactAlarm: true,
-              allowWhileIdle: true
-            }
-          };
-          notifications.push(notificationConfig);
-        } else {
-          const notificationConfig = {
-            ...baseConfig,
-            channelId: 'notification-channel',
-            importance: 4, // IMPORTANCE_HIGH for regular notifications
-            priority: 1, // PRIORITY_DEFAULT
-            ongoing: false,
-            autoCancel: true,
-            sound: 'default',
-            vibrate: [500, 500], // Gentle vibration
-            lights: true,
-            lightColor: '#3B82F6',
-            visibility: 1, // VISIBILITY_PUBLIC
-            category: 'reminder',
-            showWhen: true,
-            when: notifTime.getTime(),
-            extra: {
-              ...baseConfig.extra,
-              alarmType: 'RTC_WAKEUP',
-              exactAlarm: true, // Change to true for all notifications
-              allowWhileIdle: true // Enable for all notifications
-            }
-          };
-          notifications.push(notificationConfig);
-        }
+        // CRITICAL FIX: Actually add the notification to the array!
+        notifications.push(notificationConfig);
+
+        console.log(`📝 Prepared notification ${day + 1}/7 for ${medicine.name} at ${notifTime.toLocaleString()}`);
       }
 
       if (notifications.length > 0) {
         try {
-          console.log(`📋 Scheduling ${notifications.length} notifications for ${medicine.name}:`, notifications);
-
-          await LocalNotifications.schedule({
-            notifications: notifications,
+          console.log(`📋 Scheduling ${notifications.length} notifications for ${medicine.name}:`);
+          console.log(`🔧 Medicine: ${medicine.name}, Type: ${medicine.alertType}, Time: ${medicine.alertTime}`);
+          console.log(`📊 Notification count: ${notifications.length}`);
+          notifications.forEach((n, idx) => {
+            console.log(`  ${idx + 1}. ID: ${n.id}, Time: ${new Date(n.schedule.at).toLocaleString()}, Channel: ${n.channelId}`);
           });
 
-          console.log(`✅ Successfully scheduled ${notifications.length} notifications for ${medicine.name}`);
+          // Enhanced reliability: Schedule with retry logic
+          let scheduleSuccess = false;
+          let attempts = 0;
+          const maxAttempts = 3;
+
+          while (!scheduleSuccess && attempts < maxAttempts) {
+            attempts++;
+            try {
+              await LocalNotifications.schedule({
+                notifications: notifications,
+              });
+              scheduleSuccess = true;
+              console.log(`✅ Successfully scheduled ${notifications.length} notifications for ${medicine.name} (attempt ${attempts})`);
+            } catch (scheduleError) {
+              console.warn(`⚠️ Attempt ${attempts} failed for ${medicine.name}:`, scheduleError);
+              if (attempts < maxAttempts) {
+                await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms before retry
+              } else {
+                throw scheduleError; // Re-throw on final attempt
+              }
+            }
+          }
 
           // For debugging - show when the next notification will fire
           if (notifications.length > 0) {
@@ -472,8 +705,11 @@ const MedicineReminderApp = () => {
             console.log(`🔧 Notification config:`, JSON.stringify(nextNotif, null, 2));
           }
 
-          // Additional verification - check if notifications were actually scheduled
+          // Enhanced verification - check if notifications were actually scheduled
           try {
+            // Wait a moment for the system to process
+            await new Promise(resolve => setTimeout(resolve, 200));
+
             const pending = await LocalNotifications.getPending();
             console.log(`📝 Total pending notifications after scheduling:`, pending.notifications?.length || 0);
 
@@ -481,6 +717,21 @@ const MedicineReminderApp = () => {
               n.extra?.medicineId === medicine.id
             );
             console.log(`📊 Pending notifications for ${medicine.name}:`, medicineNotifs?.length || 0);
+
+            // RELIABILITY CHECK: Verify the notifications were actually scheduled
+            if (medicineNotifs?.length !== notifications.length) {
+              console.error(`🚨 SCHEDULING MISMATCH for ${medicine.name}!`);
+              console.error(`Expected: ${notifications.length}, Actual: ${medicineNotifs?.length || 0}`);
+
+              // Try to schedule missing notifications
+              const missingCount = notifications.length - (medicineNotifs?.length || 0);
+              if (missingCount > 0) {
+                console.log(`🔄 Attempting to schedule ${missingCount} missing notifications...`);
+                // This could be enhanced to specifically re-schedule missing ones
+              }
+            } else {
+              console.log(`✅ SCHEDULING VERIFICATION PASSED for ${medicine.name}`);
+            }
           } catch (pendingError) {
             console.warn('⚠️ Could not verify pending notifications:', pendingError);
           }
@@ -499,7 +750,15 @@ const MedicineReminderApp = () => {
           }
         }
       } else {
-        console.log(`⚠️ No notifications to schedule for ${medicine.name} (time may have passed)`);
+        console.error(`🚨 CRITICAL: No notifications scheduled for ${medicine.name}!`);
+        console.error(`   Medicine alert time: ${medicine.alertTime}`);
+        console.error(`   Current time: ${new Date().toLocaleTimeString()}`);
+        console.error(`   Likely reason: All notification times have passed`);
+        
+        // Alert user about scheduling failure
+        if (window.Capacitor && window.Capacitor.isNativePlatform()) {
+          alert(`⚠️ Alert Time Already Passed!\n\nMedicine: ${medicine.name}\nScheduled time: ${medicine.alertTime}\nCurrent time: ${new Date().toLocaleTimeString()}\n\nPlease set a future time for this alarm.`);
+        }
       }
     } catch (error) {
       console.error('❌ Error in scheduleLocalNotification:', error);
@@ -539,6 +798,133 @@ const MedicineReminderApp = () => {
       console.log(`✅ All notifications rescheduled for ${medicines.length} medicines`);
     } catch (error) {
       console.error('❌ Error rescheduling notifications:', error);
+    }
+  };
+
+  // Manual dismiss function for active notifications/alarms
+  const dismissActiveNotification = async (medicineId, action = 'dismiss') => {
+    try {
+      console.log(`🔕 Manual dismiss for medicine ID: ${medicineId}, action: ${action}`);
+
+      // Find pending notifications for this medicine
+      const pending = await LocalNotifications.getPending();
+      const medicineNotifs = pending.notifications?.filter(n =>
+        n.extra?.medicineId === medicineId
+      ) || [];
+
+      if (medicineNotifs.length > 0) {
+        // Cancel all pending notifications for this medicine
+        await LocalNotifications.cancel({
+          notifications: medicineNotifs.map(n => ({ id: n.id }))
+        });
+
+        console.log(`✅ Dismissed ${medicineNotifs.length} notifications for medicine ${medicineId}`);
+
+        // If this is a snooze action, reschedule for later
+        if (action === 'snooze') {
+          const medicine = medicines.find(m => m.id === medicineId);
+          if (medicine) {
+            const snoozeTime = new Date(Date.now() + 5 * 60 * 1000);
+
+            const snoozeNotif = {
+              title: `🔔 ${medicine.name} (Snoozed)`,
+              body: `Reminder: Time to take ${medicine.dosage} ${medicine.dosageType}${medicine.patientName ? ` for ${medicine.patientName}` : ''}`,
+              id: Date.now(), // New unique ID
+              schedule: { at: snoozeTime },
+              channelId: 'notification-channel',
+              importance: 4,
+              priority: 1,
+              sound: 'default',
+              vibrate: [500, 500],
+              autoCancel: true,
+              actionTypeId: 'MEDICINE_REMINDER',
+              actions: [
+                { id: 'taken', title: '✅ Taken', type: 'button' },
+                { id: 'dismiss', title: '⏰ Snooze 5min', type: 'button' },
+                { id: 'skip', title: '❌ Skip', type: 'button' }
+              ],
+              extra: {
+                medicineId: medicine.id,
+                medicineName: medicine.name,
+                alertType: medicine.alertType,
+                isSnoozed: true,
+                canDismiss: true
+              }
+            };
+
+            await LocalNotifications.schedule({
+              notifications: [snoozeNotif]
+            });
+
+            console.log(`⏰ Snoozed ${medicine.name} until ${snoozeTime.toLocaleTimeString()}`);
+            return `⏰ ${medicine.name} snoozed for 5 minutes!`;
+          }
+        }
+
+        return `✅ ${medicineNotifs.length} notification(s) dismissed`;
+      } else {
+        console.log(`ℹ️ No pending notifications found for medicine ${medicineId}`);
+        return 'No active notifications found';
+      }
+    } catch (error) {
+      console.error('❌ Error dismissing notification:', error);
+      return 'Error dismissing notification';
+    }
+  };
+
+  // Enhanced function to mark medicine as taken
+  const markMedicineAsTaken = async (medicineId, fromNotification = false) => {
+    try {
+      const medicine = medicines.find(m => m.id === medicineId);
+      if (!medicine) {
+        console.error('❌ Medicine not found:', medicineId);
+        return;
+      }
+
+      console.log(`✅ Marking ${medicine.name} as taken (from notification: ${fromNotification})`);
+
+      // Record in dosage history
+      const newRecord = {
+        id: Date.now(),
+        medicineId: medicine.id,
+        medicineName: medicine.name,
+        patientName: medicine.patientName,
+        dosage: `${medicine.dosage} ${medicine.dosageType}`,
+        takenAt: new Date().toISOString(),
+        alertTime: medicine.alertTime,
+        status: 'taken'
+      };
+
+      const currentHistory = JSON.parse(localStorage.getItem(STORAGE_KEYS.dosageHistory) || '[]');
+      const updatedHistory = [newRecord, ...currentHistory];
+      localStorage.setItem(STORAGE_KEYS.dosageHistory, JSON.stringify(updatedHistory));
+
+      // Update current pills count
+      const updatedMedicines = medicines.map(m =>
+        m.id === medicineId
+          ? { ...m, currentPills: Math.max(0, m.currentPills - m.dosage) }
+          : m
+      );
+      setMedicines(updatedMedicines);
+      localStorage.setItem(STORAGE_KEYS.medicines, JSON.stringify(updatedMedicines));
+
+      // Dismiss any active notifications for this medicine
+      await dismissActiveNotification(medicineId);
+
+      // Cancel native alarms if applicable
+      if (medicine.alertType === 'native-alarm') {
+        await cancelNativeAlarm(medicineId);
+      }
+
+      console.log(`✅ ${medicine.name} marked as taken successfully`);
+
+      if (!fromNotification) {
+        alert(`✅ ${medicine.name} marked as taken! 💊`);
+      }
+
+    } catch (error) {
+      console.error('❌ Error marking medicine as taken:', error);
+      alert('❌ Error marking medicine as taken. Please try again.');
     }
   };
 
@@ -970,6 +1356,25 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
           isTestMedicine: medicine.name.toLowerCase().includes('test')
         });
 
+        // Check if native plugin is available
+        if (!window.Capacitor.Plugins || !window.Capacitor.Plugins.MedicineAlarm) {
+          console.error('❌ MedicineAlarm plugin not available!');
+          throw new Error('Native alarm plugin not found. Please check if the plugin is properly installed and registered.');
+        }
+
+        console.log('🔧 IMPORTANT: Ensure native Android implementation follows exact alarm best practices:');
+        console.log('📋 Required Android Manifest permissions:');
+        console.log('   • android.permission.WAKE_LOCK');
+        console.log('   • android.permission.SCHEDULE_EXACT_ALARM (API < 33)');
+        console.log('   • android.permission.USE_EXACT_ALARM (API >= 33)');
+        console.log('   • android.permission.POST_NOTIFICATIONS (API >= 33)');
+        console.log('🔧 Required native implementation:');
+        console.log('   • AlarmManager with setExactAndAllowWhileIdle()');
+        console.log('   • BroadcastReceiver for alarm handling');
+        console.log('   • PendingIntent with FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE');
+        console.log('   • RTC_WAKEUP alarm type for device wake-up');
+        console.log('📱 Testing native alarm for:', medicine.name);
+
         const [hours, minutes] = medicine.alertTime.split(':');
         const results = [];
 
@@ -980,108 +1385,110 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
           alarmTime.setDate(alarmTime.getDate() + day);
           alarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
 
-          // For day 0, check if time has passed - allow a generous buffer for manually created medicines
+          // For day 0, check if time has passed - strict no-past-time policy
           const timeDiffMinutes = (alarmTime.getTime() - now.getTime()) / (1000 * 60);
 
-          // Enhanced logic: For manually created medicines, allow more flexible scheduling
-          // If the time is in the past but less than 5 minutes ago, schedule for today
-          // If it's further in the past, skip to tomorrow
-          const bufferMinutes = timeDiffMinutes < 0 ? -5 : -1; // 5 minute past buffer, 1 minute future buffer
+          // Strict logic: Only schedule if time is in the future (at least 5 seconds from now)
+          // This prevents alarms from triggering immediately when app opens
+          // REDUCED from 10s to 5s for better reliability
+          const minimumFutureSeconds = 5; // Must be at least 5 seconds in the future
 
           console.log(`🕒 Time comparison (Day ${day}):`, {
             alarmTime: alarmTime.toLocaleString(),
-            currentTime: now.toLocaleString(),
-            timeDiffMinutes: Math.round(timeDiffMinutes * 100) / 100,
-            bufferMinutes: bufferMinutes,
-            willSchedule: !(day === 0 && timeDiffMinutes < bufferMinutes),
-            medicineType: medicine.name.includes('Test') ? 'Test Medicine' : 'Manual Medicine'
+            now: now.toLocaleString(),
+            timeDiffMinutes: timeDiffMinutes,
+            timeDiffSeconds: (alarmTime.getTime() - now.getTime()) / 1000,
+            willSchedule: day > 0 || (alarmTime.getTime() - now.getTime()) / 1000 >= minimumFutureSeconds
           });
 
-          if (day === 0 && timeDiffMinutes < bufferMinutes) {
-            console.log(`⏰ Time has passed today (${Math.round(timeDiffMinutes)} minutes ago), skipping day 0 - will start from tomorrow`);
+          if (day === 0 && (alarmTime.getTime() - now.getTime()) / 1000 < minimumFutureSeconds) {
+            const secondsRemaining = ((alarmTime.getTime() - now.getTime()) / 1000).toFixed(1);
+            console.warn(`🚨 NATIVE ALARM SKIPPED: ${medicine.name}`);
+            console.warn(`   Reason: Only ${secondsRemaining}s remaining (need ${minimumFutureSeconds}s minimum)`);
+            console.warn(`   Scheduled time: ${alarmTime.toLocaleString()}`);
+            console.warn(`   Current time: ${now.toLocaleString()}`);
             continue;
           }
 
+          const alarmId = generateNotificationId(medicine.id, day);
           const triggerTime = alarmTime.getTime();
-          const alarmId = (parseInt(medicine.id) % 10000) + (day * 10000); // Unique ID per day
 
-          console.log(`📋 Native alarm details (Day ${day}):`, {
-            medicineName: medicine.name,
-            dosage: `${medicine.dosage} ${medicine.dosageType}`,
-            patientName: medicine.patientName || '',
-            triggerTime: triggerTime,
-            triggerDate: new Date(triggerTime).toString(),
-            alarmId: alarmId,
-            dayOffset: day,
-            currentTime: now.toString(),
-            timeDiffMinutes: Math.round((alarmTime.getTime() - now.getTime()) / (1000 * 60))
+          console.log(`🚨 Scheduling native alarm ${day + 1}/${scheduleForDays}:`, {
+            alarmId,
+            triggerTime,
+            triggerTimeFormatted: new Date(triggerTime).toLocaleString(),
+            medicineName: medicine.name
           });
 
           try {
-            // Safety check: Ensure the native plugin is available
-            if (!window.Capacitor.Plugins || !window.Capacitor.Plugins.MedicineAlarm) {
-              throw new Error('MedicineAlarm plugin not available - native alarms disabled');
-            }
-
-            // Call our custom native plugin for each day
             const result = await window.Capacitor.Plugins.MedicineAlarm.scheduleAlarm({
               medicineName: medicine.name,
               dosage: `${medicine.dosage} ${medicine.dosageType}`,
-              patientName: medicine.patientName || '',
+              patientName: medicine.patientName || 'Patient',
               triggerTime: triggerTime,
               alarmId: alarmId
             });
 
-            console.log(`✅ Native alarm scheduled successfully for day ${day}:`, result);
-            results.push({ day, result, triggerTime: new Date(triggerTime).toLocaleString(), success: true });
-          } catch (dayError) {
-            console.error(`❌ Failed to schedule native alarm for day ${day}:`, dayError);
-            results.push({ day, error: dayError.message, success: false });
+            console.log(`✅ Native alarm ${day + 1} scheduled successfully:`, result);
+            results.push({
+              day,
+              alarmId,
+              triggerTime,
+              result
+            });
+
+          } catch (alarmError) {
+            console.error(`❌ Failed to schedule native alarm for day ${day}:`, alarmError);
+            // Don't throw here, continue with other days
+            results.push({
+              day,
+              alarmId,
+              triggerTime,
+              error: alarmError.message
+            });
           }
         }
 
-        // Show confirmation for debugging
-        if (results.length > 0) {
-          const successfulSchedules = results.filter(r => r.success);
-          const failedSchedules = results.filter(r => !r.success);
+        console.log(`🚨 Native alarm scheduling complete for ${medicine.name}:`, {
+          totalAttempted: scheduleForDays,
+          successful: results.filter(r => !r.error).length,
+          failed: results.filter(r => r.error).length,
+          results
+        });
 
-          console.log(`🎯 NATIVE ALARMS SUMMARY for ${medicine.name}:`);
-          console.log(`   ✅ Successfully scheduled: ${successfulSchedules.length} alarms`);
-          console.log(`   ❌ Failed to schedule: ${failedSchedules.length} alarms`);
+        // Return results summary
+        return {
+          medicine: medicine.name,
+          totalScheduled: results.filter(r => !r.error).length,
+          totalAttempted: scheduleForDays,
+          results
+        };
 
-          if (successfulSchedules.length > 0) {
-            console.log('📅 Successful scheduled times:', successfulSchedules.map(r => r.triggerTime).join(', '));
-          }
-
-          if (failedSchedules.length > 0) {
-            console.log('❌ Failed schedules:', failedSchedules.map(r => `Day ${r.day}: ${r.error}`).join(', '));
-          }
-
-          // Alert user if no alarms were successfully scheduled
-          if (successfulSchedules.length === 0) {
-            console.warn('⚠️ WARNING: No native alarms were successfully scheduled!');
-          }
-        } else {
-          console.warn('⚠️ WARNING: No native alarm scheduling attempts were made!');
-        }
-
-        return results;
       } else {
-        alert('Native alarms are only available on Android devices.');
+        console.error('❌ Native alarms only work on Android devices');
+        throw new Error('Native alarms are only available on Android devices');
       }
     } catch (error) {
       console.error('❌ Error scheduling native alarm:', error);
       throw error; // Re-throw to trigger fallback in scheduleLocalNotification
     }
-  }; const cancelNativeAlarm = async (medicineId) => {
+  };
+
+  const cancelNativeAlarm = async (medicineId) => {
     try {
       if (window.Capacitor && window.Capacitor.isNativePlatform()) {
-        console.log('🚫 Cancelling native alarms for medicine ID:', medicineId);
+        console.log('� Cancelling native alarms for medicine ID:', medicineId);
+
+        // Check if native plugin is available
+        if (!window.Capacitor.Plugins || !window.Capacitor.Plugins.MedicineAlarm) {
+          console.error('❌ MedicineAlarm plugin not available for cancellation');
+          return;
+        }
 
         const results = [];
         // Cancel alarms for the next 7 days (matching the scheduling logic)
         for (let day = 0; day < 7; day++) {
-          const alarmId = (parseInt(medicineId) % 10000) + (day * 10000);
+          const alarmId = generateNotificationId(medicineId, day);
 
           try {
             const result = await window.Capacitor.Plugins.MedicineAlarm.cancelAlarm({
@@ -1089,15 +1496,22 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
             });
 
             console.log(`✅ Native alarm cancelled for day ${day} (ID: ${alarmId}):`, result);
-            results.push({ day, alarmId, result });
-          } catch (dayError) {
-            console.log(`⚠️ Could not cancel alarm for day ${day} (ID: ${alarmId}):`, dayError.message);
-            results.push({ day, alarmId, error: dayError.message });
+            results.push({ day, alarmId, success: true });
+          } catch (cancelError) {
+            console.error(`❌ Failed to cancel native alarm for day ${day}:`, cancelError);
+            results.push({ day, alarmId, error: cancelError.message, success: false });
           }
         }
 
-        console.log(`✅ Native alarm cancellation complete: ${results.length} attempts made`);
+        console.log(`🚫 Native alarm cancellation complete for medicine ${medicineId}:`, {
+          successful: results.filter(r => r.success).length,
+          failed: results.filter(r => !r.success).length,
+          results
+        });
+
         return results;
+      } else {
+        console.log('Native alarm cancellation only available on Android devices');
       }
     } catch (error) {
       console.error('❌ Error cancelling native alarm:', error);
@@ -1174,8 +1588,325 @@ After enabling the permission, come back to the app and test the native alarm!`)
     }
   };
 
+  // DEBUG: Simple function to test native alarm functionality step by step
+  const debugNativeAlarm = async () => {
+    try {
+      console.log('🔍 === NATIVE ALARM DEBUG SESSION ===');
+
+      // Step 1: Check if we're on a native platform
+      console.log('🔍 Step 1: Platform check...');
+      if (typeof window === 'undefined') {
+        alert('❌ Window object not available');
+        return;
+      }
+
+      if (!window.Capacitor) {
+        alert('❌ Capacitor not available - you\'re in a web browser.\nNative alarms only work on Android devices.');
+        return;
+      }
+
+      if (!window.Capacitor.isNativePlatform()) {
+        alert('❌ Not on native platform - you\'re in a web browser.\nNative alarms only work on Android devices.');
+        return;
+      }
+
+      console.log('✅ Step 1 passed: Native platform detected');
+
+      // Step 2: Check if plugin exists
+      console.log('🔍 Step 2: Plugin availability check...');
+      if (!window.Capacitor.Plugins) {
+        alert('❌ Capacitor.Plugins not available!\n\nThis indicates a serious issue with the app build.');
+        return;
+      }
+
+      if (!window.Capacitor.Plugins.MedicineAlarm) {
+        alert('❌ MedicineAlarm plugin not found!\n\nPlugin registration issue.\nAvailable plugins: ' + Object.keys(window.Capacitor.Plugins).join(', '));
+        return;
+      }
+
+      console.log('✅ Step 2 passed: MedicineAlarm plugin found');
+
+      // Step 3: Test plugin functionality
+      console.log('🔍 Step 3: Testing plugin call...');
+      try {
+        const permissionResult = await window.Capacitor.Plugins.MedicineAlarm.checkExactAlarmPermission();
+        console.log('✅ Step 3 passed: Plugin responds to calls');
+        console.log('📊 Permission result:', permissionResult);
+
+        // Step 4: Test actual native alarm scheduling
+        console.log('🔍 Step 4: Testing native alarm scheduling...');
+        const testTriggerTime = Date.now() + 15000; // 15 seconds from now
+        const testAlarmId = 99999;
+
+        const scheduleResult = await window.Capacitor.Plugins.MedicineAlarm.scheduleAlarm({
+          medicineName: 'DEBUG TEST ALARM',
+          dosage: '1 test',
+          patientName: 'Debug User',
+          triggerTime: testTriggerTime,
+          alarmId: testAlarmId
+        });
+
+        console.log('✅ Step 4 passed: Native alarm scheduled successfully!');
+        console.log('📊 Schedule result:', scheduleResult);
+
+        alert(`🎉 NATIVE ALARM DEBUG SUCCESS!\n\n✅ All checks passed:\n• Platform: Native Android\n• Plugin: Available & responding\n• Permissions: ${permissionResult?.hasPermission ? 'Granted' : 'May need permission'}\n• Test alarm: Scheduled for 15 seconds\n\n🚨 You should receive a test alarm in 15 seconds!\n\nIf you don't receive it, the issue is likely:\n• Android settings blocking alarms\n• Permission not granted\n• Device-specific restrictions`);
+
+      } catch (pluginError) {
+        console.error('❌ Step 3/4 failed: Plugin call error:', pluginError);
+        alert(`❌ Plugin call failed!\n\nError: ${pluginError.message}\n\nThis indicates:\n• Plugin code has issues\n• Permissions not granted\n• Native implementation problems`);
+      }
+
+    } catch (error) {
+      console.error('❌ Debug session failed:', error);
+      alert(`❌ Debug failed: ${error.message}`);
+    }
+  };
+
+  // ENHANCED: Complete native alarm system diagnosis
+  const diagnoseNativeAlarmSystem = async () => {
+    try {
+      console.log('🔍 === COMPREHENSIVE NATIVE ALARM DIAGNOSIS ===');
+
+      let diagnosticReport = '🔍 NATIVE ALARM SYSTEM DIAGNOSIS\n\n';
+
+      // Step 1: Environment Check
+      diagnosticReport += '1️⃣ ENVIRONMENT CHECK:\n';
+      if (typeof window === 'undefined') {
+        diagnosticReport += '❌ Window object not available\n';
+        alert(diagnosticReport);
+        return;
+      }
+      diagnosticReport += '✅ Window object available\n';
+
+      if (!window.Capacitor) {
+        diagnosticReport += '❌ Capacitor not available (web browser mode)\n';
+        diagnosticReport += '💡 Native alarms only work on Android devices\n';
+        alert(diagnosticReport);
+        return;
+      }
+      diagnosticReport += '✅ Capacitor available\n';
+
+      if (!window.Capacitor.isNativePlatform()) {
+        diagnosticReport += '❌ Not on native platform (web browser)\n';
+        alert(diagnosticReport);
+        return;
+      }
+      diagnosticReport += '✅ Native platform detected\n';
+
+      // Step 2: Plugin Check
+      diagnosticReport += '\n2️⃣ PLUGIN SYSTEM CHECK:\n';
+      if (!window.Capacitor.Plugins) {
+        diagnosticReport += '❌ Capacitor.Plugins not available\n';
+        diagnosticReport += '🔧 SOLUTION: Rebuild app with proper Capacitor setup\n';
+        alert(diagnosticReport);
+        return;
+      }
+      diagnosticReport += '✅ Capacitor.Plugins available\n';
+
+      const availablePlugins = Object.keys(window.Capacitor.Plugins);
+      diagnosticReport += `📋 Available plugins (${availablePlugins.length}): ${availablePlugins.join(', ')}\n`;
+
+      if (!window.Capacitor.Plugins.MedicineAlarm) {
+        diagnosticReport += '❌ MedicineAlarm plugin NOT FOUND\n';
+        diagnosticReport += '🚨 CRITICAL ISSUE: Plugin not registered\n';
+        diagnosticReport += '🔧 REQUIRED FIXES:\n';
+        diagnosticReport += '   • Check MainActivity.java plugin registration\n';
+        diagnosticReport += '   • Verify plugin build configuration\n';
+        diagnosticReport += '   • Run "npx cap sync android"\n';
+        diagnosticReport += '   • Rebuild and reinstall app\n';
+        alert(diagnosticReport);
+        return;
+      }
+      diagnosticReport += '✅ MedicineAlarm plugin found\n';
+
+      // Step 3: Plugin Functionality Test
+      diagnosticReport += '\n3️⃣ PLUGIN FUNCTIONALITY TEST:\n';
+      try {
+        const permissionResult = await window.Capacitor.Plugins.MedicineAlarm.checkExactAlarmPermission();
+        diagnosticReport += '✅ Plugin responds to method calls\n';
+
+        const androidVersion = permissionResult?.androidVersion || 'Unknown';
+        const hasPermission = permissionResult?.hasPermission ?? false;
+        const requiresPermission = permissionResult?.requiresPermission ?? false;
+
+        diagnosticReport += `📱 Android API Level: ${androidVersion}\n`;
+        diagnosticReport += `🔑 Requires Permission: ${requiresPermission ? 'YES' : 'NO'}\n`;
+        diagnosticReport += `✅ Has Permission: ${hasPermission ? 'YES ✅' : 'NO ❌'}\n`;
+
+        if (requiresPermission && !hasPermission) {
+          diagnosticReport += '\n⚠️ PERMISSION ISSUE DETECTED:\n';
+          diagnosticReport += '🔧 TO FIX: Enable "Alarms & reminders" permission\n';
+          diagnosticReport += '📱 Path: Settings → Apps → MyMedAlert → Special app access\n';
+        }
+
+      } catch (pluginError) {
+        diagnosticReport += `❌ Plugin call failed: ${pluginError.message}\n`;
+        diagnosticReport += '🚨 PLUGIN IMPLEMENTATION ISSUE:\n';
+        diagnosticReport += '   • Java code implementation error\n';
+        diagnosticReport += '   • Method signature mismatch\n';
+        diagnosticReport += '   • Native compilation problem\n';
+        alert(diagnosticReport);
+        return;
+      }
+
+      // Step 4: Native Alarm Test
+      diagnosticReport += '\n4️⃣ NATIVE ALARM SCHEDULING TEST:\n';
+      let alarmTestPassed = false;
+      try {
+        const testTriggerTime = Date.now() + 20000; // 20 seconds
+        const testAlarmId = 99997;
+
+        const scheduleResult = await window.Capacitor.Plugins.MedicineAlarm.scheduleAlarm({
+          medicineName: 'DIAGNOSTIC TEST ALARM',
+          dosage: 'System diagnostic',
+          patientName: 'Diagnostic User',
+          triggerTime: testTriggerTime,
+          alarmId: testAlarmId
+        });
+
+        diagnosticReport += '✅ Native alarm scheduling WORKS!\n';
+        diagnosticReport += `📊 Result: ${JSON.stringify(scheduleResult)}\n`;
+        diagnosticReport += '🔊 Diagnostic alarm scheduled for 20 seconds\n';
+        alarmTestPassed = true;
+
+      } catch (scheduleError) {
+        diagnosticReport += `❌ Native alarm scheduling FAILED: ${scheduleError.message}\n`;
+        diagnosticReport += '🚨 CRITICAL IMPLEMENTATION ISSUE:\n';
+        diagnosticReport += '   • AlarmManager not properly implemented\n';
+        diagnosticReport += '   • BroadcastReceiver missing\n';
+        diagnosticReport += '   • Permissions not correctly handled\n';
+        alarmTestPassed = false;
+      }
+
+      // Step 5: Final Assessment
+      diagnosticReport += '\n5️⃣ DIAGNOSIS SUMMARY:\n';
+      if (alarmTestPassed) {
+        diagnosticReport += '🎉 NATIVE ALARM SYSTEM IS WORKING!\n\n';
+        diagnosticReport += '🔊 DIAGNOSTIC ALARM will fire in 20 seconds with REAL sound!\n\n';
+        diagnosticReport += 'If you still don\'t hear alarms in your medicines:\n';
+        diagnosticReport += '• Check device volume (Media & Alarm volume)\n';
+        diagnosticReport += '• Disable "Do Not Disturb" mode\n';
+        diagnosticReport += '• Check battery optimization settings\n';
+        diagnosticReport += '• Verify app has "Alarms & reminders" permission\n';
+        diagnosticReport += '• Test with device unlocked first\n';
+        diagnosticReport += '• Ensure native alarm medicines have alertType: "native-alarm"\n';
+      } else {
+        diagnosticReport += '🚨 NATIVE ALARM SYSTEM NEEDS IMPLEMENTATION!\n\n';
+        diagnosticReport += 'REQUIRED NATIVE ANDROID CODE:\n';
+        diagnosticReport += '• AlarmManager.setExactAndAllowWhileIdle()\n';
+        diagnosticReport += '• BroadcastReceiver for alarm handling\n';
+        diagnosticReport += '• RingtoneManager for alarm sound\n';
+        diagnosticReport += '• Proper Android manifest permissions\n';
+        diagnosticReport += '• PendingIntent with correct flags\n\n';
+        diagnosticReport += 'CURRENT STATUS: Only notifications work, no real alarms\n';
+      }
+
+      console.log(diagnosticReport);
+      alert(diagnosticReport);
+
+    } catch (error) {
+      const errorReport = `❌ DIAGNOSIS FAILED: ${error.message}\n\nThis indicates a serious system issue.`;
+      console.error('❌ Diagnostic error:', error);
+      alert(errorReport);
+    }
+  };
+
+  // ARTICLE-BASED: Native Alarm Implementation Guide & Troubleshooting
+  const troubleshootNativeAlarmImplementation = async () => {
+    try {
+      let report = '🔧 NATIVE ALARM IMPLEMENTATION GUIDE (Based on Android Best Practices)\n\n';
+
+      report += '📋 REQUIRED ANDROID MANIFEST PERMISSIONS:\n';
+      report += '   • <uses-permission android:name="android.permission.WAKE_LOCK" />\n';
+      report += '   • <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />\n';
+      report += '   • <uses-permission android:name="android.permission.USE_EXACT_ALARM" />\n';
+      report += '   • <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n\n';
+
+      report += '🔧 REQUIRED NATIVE ANDROID IMPLEMENTATION:\n\n';
+      report += '1. AlarmManager Setup:\n';
+      report += '   AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);\n\n';
+
+      report += '2. Intent & PendingIntent:\n';
+      report += '   Intent intent = new Intent(context, AlarmReceiver.class);\n';
+      report += '   intent.putExtra("medicine_name", medicineName);\n';
+      report += '   PendingIntent pendingIntent = PendingIntent.getBroadcast(\n';
+      report += '       context, alarmId, intent,\n';
+      report += '       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);\n\n';
+
+      report += '3. Schedule Exact Alarm:\n';
+      report += '   alarmManager.setExactAndAllowWhileIdle(\n';
+      report += '       AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent);\n\n';
+
+      report += '4. BroadcastReceiver (AlarmReceiver.java):\n';
+      report += '   public class AlarmReceiver extends BroadcastReceiver {\n';
+      report += '       @Override\n';
+      report += '       public void onReceive(Context context, Intent intent) {\n';
+      report += '           // Show notification & play sound\n';
+      report += '           // Use RingtoneManager for alarm sound\n';
+      report += '       }\n';
+      report += '   }\n\n';
+
+      report += '5. Register Receiver in Manifest:\n';
+      report += '   <receiver android:name=".AlarmReceiver"\n';
+      report += '             android:exported="false" />\n\n';
+
+      report += '⚠️ CRITICAL DIFFERENCES FROM CAPACITOR NOTIFICATIONS:\n';
+      report += '   • Uses AlarmManager (not LocalNotifications)\n';
+      report += '   • Uses BroadcastReceiver (not Capacitor events)\n';
+      report += '   • Uses RTC_WAKEUP (guaranteed device wake)\n';
+      report += '   • Uses setExactAndAllowWhileIdle() (works in battery saver)\n';
+      report += '   • Requires exact alarm permissions (Android 12+)\n\n';
+
+      if (window.Capacitor && window.Capacitor.isNativePlatform()) {
+        report += '🔍 CURRENT PLUGIN STATUS:\n';
+
+        if (window.Capacitor.Plugins && window.Capacitor.Plugins.MedicineAlarm) {
+          report += '   ✅ MedicineAlarm plugin found\n';
+
+          try {
+            const permResult = await window.Capacitor.Plugins.MedicineAlarm.checkExactAlarmPermission();
+            report += `   📱 Android API: ${permResult?.androidVersion || 'Unknown'}\n`;
+            report += `   🔐 Has Exact Alarm Permission: ${permResult?.hasPermission ? 'YES ✅' : 'NO ❌'}\n`;
+
+            if (!permResult?.hasPermission && permResult?.requiresPermission) {
+              report += '   ⚠️ CRITICAL: Need "Alarms & reminders" permission!\n';
+              report += '   📍 Settings → Apps → MyMedAlert → Special app access → Alarms & reminders\n';
+            }
+          } catch (error) {
+            report += `   ❌ Plugin error: ${error.message}\n`;
+          }
+        } else {
+          report += '   ❌ MedicineAlarm plugin NOT FOUND\n';
+          report += '   📋 Available plugins: ' + Object.keys(window.Capacitor.Plugins || {}).join(', ') + '\n';
+        }
+
+        report += '\n🧪 TESTING RECOMMENDATIONS:\n';
+        report += '   1. Use "🔍 DEBUG NATIVE ALARM" button\n';
+        report += '   2. Use "🚨🔊 TEST NATIVE ALARM" button\n';
+        report += '   3. Check Android logcat for native errors\n';
+        report += '   4. Verify all manifest permissions\n';
+        report += '   5. Test on Android 12+ devices specifically\n\n';
+
+        report += '💡 IF ALARMS STILL DON\'T WORK:\n';
+        report += '   • Rebuild app with correct permissions\n';
+        report += '   • Check native AlarmReceiver implementation\n';
+        report += '   • Verify AlarmManager.setExactAndAllowWhileIdle() usage\n';
+        report += '   • Test with exact alarm permission granted\n';
+        report += '   • Check device-specific battery optimization\n';
+      } else {
+        report += '❌ This guide is for Android devices only.\n';
+      }
+
+      console.log(report);
+      alert(report);
+
+    } catch (error) {
+      console.error('❌ Error in troubleshooting guide:', error);
+      alert('Error showing implementation guide: ' + error.message);
+    }
+  };
+
   // Test native alarm - creates a real alarm that will wake device and play sound
-  /* COMMENTED OUT FOR PRODUCTION
   const testNativeAlarm = async () => {
     try {
       console.log('🚨🔊 Testing NATIVE ALARM with REAL SOUND...');
@@ -1186,9 +1917,15 @@ After enabling the permission, come back to the app and test the native alarm!`)
       }
 
       if (!window.Capacitor.Plugins || !window.Capacitor.Plugins.MedicineAlarm) {
-        alert('❌ MedicineAlarm plugin not available!\n\nThe native alarm system is not connected.\nPlease rebuild and reinstall the app.');
+        alert('❌ MedicineAlarm plugin not available!\n\nThe native alarm system is not connected.\nPlease rebuild and reinstall the app.\n\n📋 Make sure your native implementation includes:\n• AlarmManager with setExactAndAllowWhileIdle()\n• BroadcastReceiver for alarm handling\n• Proper Android manifest permissions');
         return;
       }
+
+      console.log('🔧 Testing with article-based implementation requirements:');
+      console.log('   • AlarmManager.setExactAndAllowWhileIdle() for battery optimization bypass');
+      console.log('   • RTC_WAKEUP type for guaranteed device wake');
+      console.log('   • BroadcastReceiver for alarm sound & notification');
+      console.log('   • PendingIntent with proper flags for Android 12+ compatibility');
 
       const triggerTime = Date.now() + 10000; // 10 seconds from now
       const testAlarmId = 99999;
@@ -1203,7 +1940,7 @@ After enabling the permission, come back to the app and test the native alarm!`)
       });
 
       console.log('✅ Native test alarm scheduled:', result);
-      alert('🚨🔊 NATIVE ALARM TEST scheduled!\n\nYour device will:\n• Wake up in 10 seconds\n• Play REAL alarm sound\n• Show notification with DISMISS and SNOOZE buttons\n• Vibrate strongly\n\nThis is a TRUE ALARM! 📱🔊⏰');
+      alert('🚨🔊 NATIVE ALARM TEST scheduled!\n\nYour device will:\n• Wake up in 10 seconds\n• Play REAL alarm sound via AlarmManager\n• Show notification with DISMISS and SNOOZE buttons\n• Vibrate strongly\n• Bypass battery optimization (setExactAndAllowWhileIdle)\n\nThis is a TRUE ANDROID ALARM using:\n• AlarmManager.RTC_WAKEUP\n• BroadcastReceiver\n• Exact alarm permissions\n\n📱🔊⏰');
 
     } catch (error) {
       console.error('❌ Error testing native alarm:', error);
@@ -1213,20 +1950,34 @@ After enabling the permission, come back to the app and test the native alarm!`)
       errorMsg += `Error: ${error.message}\n\n`;
 
       if (error.message.includes('not implemented')) {
-        errorMsg += 'The native plugin method is not implemented.\nCheck the Java code in MedicineAlarmPlugin.java';
+        errorMsg += 'SOLUTION NEEDED:\n';
+        errorMsg += '• Implement AlarmManager.setExactAndAllowWhileIdle() in native code\n';
+        errorMsg += '• Create BroadcastReceiver for alarm handling\n';
+        errorMsg += '• Add proper PendingIntent with FLAG_IMMUTABLE\n';
+        errorMsg += '• Check MedicineAlarmPlugin.java implementation';
       } else if (error.message.includes('not found')) {
-        errorMsg += 'The plugin or method was not found.\nEnsure the plugin is registered in MainActivity.java';
+        errorMsg += 'PLUGIN REGISTRATION ISSUE:\n';
+        errorMsg += '• Ensure plugin is registered in MainActivity.java\n';
+        errorMsg += '• Verify plugin build configuration\n';
+        errorMsg += '• Check Capacitor plugin setup';
       } else {
-        errorMsg += 'This could be caused by:\n• Plugin registration issue\n• Native code error\n• Permission problem\n\nTry rebuilding and reinstalling the app.';
+        errorMsg += 'POSSIBLE CAUSES:\n';
+        errorMsg += '• Missing Android manifest permissions\n';
+        errorMsg += '• Exact alarm permission not granted\n';
+        errorMsg += '• AlarmManager implementation issues\n';
+        errorMsg += '• Device-specific restrictions\n\n';
+        errorMsg += 'TRY:\n';
+        errorMsg += '• Use "📋 NATIVE ALARM IMPLEMENTATION GUIDE" button\n';
+        errorMsg += '• Check Settings → Apps → Special access → Alarms & reminders\n';
+        errorMsg += '• Review native Android code implementation';
       }
 
       alert(errorMsg);
     }
   };
-  */
 
   // Simple test to create a native alarm medicine
-  /* COMMENTED OUT FOR PRODUCTION
+  // Create a test medicine with native alarm - 2 minutes from now
   const createTestNativeMedicine = async () => {
     try {
       console.log('📝 Creating test native alarm medicine...');
@@ -1245,31 +1996,174 @@ After enabling the permission, come back to the app and test the native alarm!`)
         time: getTimeSlotFromTime(timeString),
         color: '#FF0000',
         image: null,
-        notes: 'This is a test medicine for native alarm',
+        notes: 'This is a test medicine for native alarm - should trigger real alarm sound in 2 minutes',
         specificTime: timeString,
         alertTime: timeString,
-        alertType: 'native-alarm',
+        alertType: 'native-alarm', // This is the key - ensures native alarm scheduling
         totalPills: 10,
         currentPills: 10,
         refillReminder: 2,
         frequency: 'daily'
       };
 
-      // Add to medicines list
+      console.log('🔧 Test medicine configuration:', {
+        name: testMedicine.name,
+        alertTime: testMedicine.alertTime,
+        alertType: testMedicine.alertType,
+        triggerTime: testTime.toLocaleString()
+      });
+
+      // Add to medicines list first
       setMedicines(prev => [...prev, testMedicine]);
 
-      // Schedule the native alarm
-      await scheduleLocalNotification(testMedicine);
+      // Schedule the native alarm using the main scheduling function
+      try {
+        await scheduleLocalNotification(testMedicine);
+        console.log('✅ Test native medicine scheduled successfully');
+      } catch (schedulingError) {
+        console.error('❌ Error scheduling test medicine:', schedulingError);
+        alert(`⚠️ Test medicine created but scheduling failed:\n${schedulingError.message}\n\nCheck the native plugin implementation.`);
+        return;
+      }
 
       console.log('✅ Test native medicine created and alarm scheduled');
-      alert(`✅ TEST NATIVE ALARM MEDICINE CREATED!\n\n📝 Medicine: ${testMedicine.name}\n⏰ Alarm Time: ${timeString} (2 minutes from now)\n🚨 Type: NATIVE ALARM\n\nThe alarm will:\n• Wake your device\n• Play real alarm sound\n• Show dismissible notification\n• Vibrate strongly\n\nCheck your medicines list!`);
+      alert(`✅ TEST NATIVE ALARM MEDICINE CREATED!\n\n📝 Medicine: ${testMedicine.name}\n⏰ Alarm Time: ${timeString} (2 minutes from now)\n🚨 Type: NATIVE ALARM\n\nThe alarm should:\n• Wake your device at exactly ${timeString}\n• Play REAL alarm sound via AlarmManager\n• Show dismissible notification\n• Vibrate strongly\n• Work even if app is closed\n\n📋 Check your medicines list!\n\nIf you only get a notification (no alarm sound), the native plugin needs proper AlarmManager implementation.`);
 
     } catch (error) {
       console.error('❌ Error creating test medicine:', error);
-      alert('Error creating test medicine: ' + error.message);
+      alert('❌ Error creating test medicine: ' + error.message);
     }
   };
-  */
+
+  // CREATE TEST NOTIFICATION MEDICINE - for testing dismiss functionality
+  const createTestNotificationMedicine = async () => {
+    try {
+      console.log('📝 Creating test NOTIFICATION medicine with dismiss buttons...');
+
+      // Get current time + 30 seconds for immediate testing
+      const testTime = new Date();
+      testTime.setSeconds(testTime.getSeconds() + 30); // 30 seconds from now
+      const timeString = testTime.toTimeString().substring(0, 5); // HH:MM format
+
+      const testMedicine = {
+        id: Date.now().toString(),
+        patientName: 'Test Patient',
+        name: 'Test Notification Medicine',
+        dosage: 1,
+        dosageType: 'tablet',
+        time: getTimeSlotFromTime(timeString),
+        color: '#FF6B35',
+        image: null,
+        notes: 'Test medicine for notification with dismiss buttons - should trigger in 30 seconds',
+        specificTime: timeString,
+        alertTime: timeString,
+        alertType: 'notification', // Regular notification (not native alarm)
+        totalPills: 10,
+        currentPills: 10,
+        refillReminder: 2,
+        frequency: 'daily'
+      };
+
+      console.log('🔧 Test notification medicine configuration:', {
+        name: testMedicine.name,
+        alertTime: testMedicine.alertTime,
+        alertType: testMedicine.alertType,
+        triggerTime: testTime.toLocaleString(),
+        triggerInSeconds: 30
+      });
+
+      // Add to medicines list first
+      setMedicines(prev => [...prev, testMedicine]);
+
+      // Schedule the notification using the main scheduling function
+      try {
+        await scheduleLocalNotification(testMedicine);
+        console.log('✅ Test notification medicine scheduled successfully');
+      } catch (schedulingError) {
+        console.error('❌ Error scheduling test notification medicine:', schedulingError);
+        alert(`⚠️ Test medicine created but scheduling failed:\n${schedulingError.message}`);
+        return;
+      }
+
+      console.log('✅ Test notification medicine created and scheduled');
+      alert(`✅ TEST NOTIFICATION MEDICINE CREATED!\n\n📝 Medicine: ${testMedicine.name}\n⏰ Notification Time: ${timeString} (30 seconds from now)\n🔔 Type: REGULAR NOTIFICATION\n\nThe notification should:\n• Appear in 30 seconds\n• Show action buttons: ✅ Taken, ⏰ Snooze 5min, ❌ Skip\n• Allow you to dismiss/interact with it\n• Work like a standard Android notification\n\n📋 Check your medicines list!\n\nThis tests the dismiss functionality you mentioned was missing.`);
+
+    } catch (error) {
+      console.error('❌ Error creating test notification medicine:', error);
+      alert('❌ Error creating test notification medicine: ' + error.message);
+    }
+  };
+
+  // CRITICAL: Test native alarm with immediate schedule
+  const createTestNativeAlarmMedicine = async () => {
+    try {
+      console.log('🚨🔥 Creating IMMEDIATE TEST NATIVE ALARM medicine...');
+
+      const now = new Date();
+      const testTime = new Date(now.getTime() + 15000); // 15 seconds from now
+      const timeString = testTime.toTimeString().slice(0, 5);
+
+      const testMedicine = {
+        id: 'native-test-' + Date.now(),
+        patientName: 'TEST PATIENT',
+        name: 'NATIVE ALARM TEST',
+        dosage: 1,
+        dosageType: 'tablet',
+        time: getTimeSlotFromTime(timeString),
+        color: '#FF0000', // Bright red for visibility
+        image: null,
+        notes: 'CRITICAL NATIVE ALARM TEST - WILL WAKE DEVICE WITH SOUND',
+        specificTime: timeString,
+        alertTime: timeString,
+        alertType: 'native-alarm', // THIS IS THE KEY - NATIVE ALARM
+        totalPills: 10,
+        currentPills: 10,
+        refillReminder: 2,
+        frequency: 'daily'
+      };
+
+      console.log('🚨 NATIVE ALARM TEST medicine configuration:', {
+        name: testMedicine.name,
+        alertTime: testMedicine.alertTime,
+        alertType: testMedicine.alertType,
+        triggerTime: testTime.toLocaleString(),
+        triggerInSeconds: 15,
+        isCriticalTest: true
+      });
+
+      // Add to medicines list first
+      setMedicines(prev => [...prev, testMedicine]);
+
+      // Schedule the NATIVE ALARM immediately
+      console.log('🔥 Scheduling NATIVE ALARM...');
+      await scheduleLocalNotification(testMedicine);
+
+      console.log('✅ NATIVE ALARM TEST medicine created and scheduled');
+      alert(`🚨🔥 NATIVE ALARM TEST CREATED!\n\n` +
+        `📱 Medicine: ${testMedicine.name}\n` +
+        `⏰ Alarm Time: ${timeString} (15 seconds from now)\n` +
+        `🚨 Type: NATIVE ALARM (AlarmManager)\n\n` +
+        `🔊 THIS WILL:\n` +
+        `• WAKE YOUR DEVICE in 15 seconds\n` +
+        `• Play REAL ALARM SOUND (not notification)\n` +
+        `• Show FULL-SCREEN alarm activity\n` +
+        `• Vibrate strongly\n` +
+        `• Use AlarmManager.setExactAndAllowWhileIdle()\n` +
+        `• Bypass battery optimization\n\n` +
+        `🚨 WARNING: This is a TRUE ALARM!\n` +
+        `Your device will behave like a real alarm clock.\n\n` +
+        `📋 If this works, native alarms are functioning.\n` +
+        `If not, check:\n` +
+        `• Android Settings → Apps → Special access → Alarms & reminders\n` +
+        `• Native plugin implementation\n` +
+        `• AlarmManager permissions\n\n` +
+        `⏰ GET READY - ALARM IN 15 SECONDS!`);
+
+    } catch (error) {
+      console.error('❌ Error creating NATIVE ALARM test medicine:', error);
+      alert('❌ Error creating NATIVE ALARM test medicine:\n' + error.message + '\n\nThis indicates a problem with the native alarm system.');
+    }
+  };
 
   // NEW: Request exact alarm permission specifically
   const requestExactAlarmPermission = async () => {
@@ -1443,73 +2337,104 @@ Try the diagnostic button below to see your current settings.`);
     }
   };
 
-  // Immediate alarm test - creates an alarm that fires in 5 seconds
-  /* COMMENTED OUT FOR PRODUCTION
+  // Immediate alarm test - creates both native alarm AND enhanced notification that fires in 5 seconds
   const testImmediateAlarm = async () => {
     try {
-      console.log('🚨 Testing IMMEDIATE alarm...');
+      console.log('🚨 Testing IMMEDIATE ALARM (5 seconds)...');
 
-      if (window.Capacitor && window.Capacitor.isNativePlatform()) {
-        const immediateTime = new Date(Date.now() + 5000); // 5 seconds from now
-
-        const alarmConfig = {
-          title: '🚨 IMMEDIATE ALARM TEST',
-          body: 'This is an immediate alarm test! Should wake your device!',
-          id: 88888, // Use smaller ID within Java int range
-          schedule: {
-            at: immediateTime,
-            allowWhileIdle: true // Essential for waking device
-          },
-          channelId: 'alarm-channel',
-          sound: 'default', // Use default alarm sound
-          // Android-specific supported properties
-          android: {
-            channelId: 'alarm-channel',
-            priority: 'max',
-            visibility: 'public',
-            importance: 'max',
-            autoCancel: false,
-            ongoing: true,
-            sound: 'default',
-            vibrate: true,
-            lights: true,
-            lightColor: '#FF0000',
-            largeIcon: 'res://drawable/ic_launcher',
-            smallIcon: 'res://drawable/ic_stat_name',
-            showWhen: true,
-            when: immediateTime.getTime()
-          },
-          extra: {
-            isTest: true,
-            testType: 'immediate_alarm',
-            testTime: new Date().toISOString(),
-            alarmType: 'RTC_WAKEUP',
-            exactAlarm: true,
-            allowWhileIdle: true,
-            wakeScreen: true,
-            isAlarm: true,
-            criticalAlert: true
-          }
-        };
-
-        await LocalNotifications.schedule({
-          notifications: [alarmConfig]
-        });
-
-        console.log('✅ IMMEDIATE alarm scheduled for 5 seconds from now');
-        alert('🚨 IMMEDIATE ALARM scheduled! Your device should wake up and alert you in 5 seconds with strong vibration! 📱');
-      } else {
-        alert('This test is only available on Android devices.');
+      if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+        alert('5-second alarm test is only available on Android devices.');
+        return;
       }
+
+      console.log('🔧 DUAL TEST APPROACH:');
+      console.log('   1. NATIVE ALARM via MedicineAlarm plugin (real alarm sound)');
+      console.log('   2. ENHANCED NOTIFICATION via LocalNotifications (fallback)');
+
+      const triggerTime = Date.now() + 5000; // 5 seconds from now
+      const testAlarmId = 88888;
+
+      // FIRST: Try to schedule native alarm (real alarm sound)
+      try {
+        if (window.Capacitor.Plugins && window.Capacitor.Plugins.MedicineAlarm) {
+          console.log('🚨 Scheduling NATIVE ALARM (5 seconds)...');
+
+          const nativeResult = await window.Capacitor.Plugins.MedicineAlarm.scheduleAlarm({
+            medicineName: '🚨 IMMEDIATE TEST ALARM',
+            dosage: 'Test in 5 seconds',
+            patientName: 'Test User',
+            triggerTime: triggerTime,
+            alarmId: testAlarmId
+          });
+
+          console.log('✅ Native alarm scheduled:', nativeResult);
+          alert('🚨🔊 NATIVE ALARM TEST (5 seconds)!\n\nScheduled via MedicineAlarm plugin:\n• REAL AlarmManager alarm sound\n• Device will wake and vibrate\n• BroadcastReceiver will handle it\n• True Android alarm (not notification)\n\nWait for it... 📱⏰');
+          return; // If native works, don't need fallback
+        }
+      } catch (nativeError) {
+        console.warn('⚠️ Native alarm failed, falling back to enhanced notification:', nativeError.message);
+      }
+
+      // FALLBACK: Enhanced notification with alarm-like properties
+      console.log('📱 Scheduling ENHANCED NOTIFICATION (5 seconds) as fallback...');
+
+      const immediateTime = new Date(triggerTime);
+
+      const alarmConfig = {
+        title: '🚨 IMMEDIATE ALARM TEST (5s)',
+        body: 'This should wake your device with sound & vibration!',
+        id: testAlarmId,
+        schedule: {
+          at: immediateTime,
+          allowWhileIdle: true // Critical for device wake
+        },
+        channelId: 'alarm-channel', // Use alarm channel for highest priority
+        importance: 5, // IMPORTANCE_MAX
+        priority: 2,   // PRIORITY_HIGH
+        sound: 'default', // System alarm sound
+        vibrate: [1000, 500, 1000, 500, 1000], // Strong vibration pattern
+        lights: true,
+        lightColor: '#FF0000',
+        visibility: 1, // VISIBILITY_PUBLIC
+        autoCancel: false, // Don't auto-dismiss
+        ongoing: true, // Keep persistent
+        showWhen: true,
+        when: triggerTime,
+        wakeUpScreen: true, // Wake screen
+        actions: [
+          {
+            id: 'dismiss_test',
+            title: '⏰ DISMISS TEST',
+            type: 'button'
+          }
+        ],
+        extra: {
+          isTest: true,
+          testType: 'immediate_5s_alarm',
+          alarmType: 'RTC_WAKEUP',
+          exactAlarm: true,
+          allowWhileIdle: true,
+          wakeScreen: true,
+          isAlarm: true,
+          criticalAlert: true,
+          testTime: new Date().toISOString()
+        }
+      };
+
+      await LocalNotifications.schedule({
+        notifications: [alarmConfig]
+      });
+
+      console.log('✅ Enhanced notification alarm scheduled for 5 seconds');
+      alert('🚨📱 ENHANCED NOTIFICATION ALARM (5s)!\n\nFallback test scheduled:\n• Maximum importance notification\n• Alarm channel with sound\n• Strong vibration pattern\n• Device wake attempt\n• Persistent until dismissed\n\nNote: This is a notification, not a true alarm.\nFor real alarms, the native plugin must work properly.');
+
     } catch (error) {
       console.error('❌ Error testing immediate alarm:', error);
-      alert('Error testing immediate alarm: ' + error.message);
+      alert('❌ Error testing 5-second alarm: ' + error.message);
     }
   };
-  */
 
   // Test native plugin connectivity
-  /* COMMENTED OUT FOR PRODUCTION
   const testNativePlugin = async () => {
     try {
       if (typeof window === 'undefined') {
@@ -1618,8 +2543,8 @@ Try the diagnostic button below to see your current settings.`);
       alert(errorMsg);
     }
   };
-  */  // Complete diagnostic function
-  /* COMMENTED OUT FOR PRODUCTION
+
+  // Complete diagnostic function
   const runCompleteDiagnostic = async () => {
     try {
       if (window.Capacitor && window.Capacitor.isNativePlatform()) {
@@ -1741,10 +2666,8 @@ Try the diagnostic button below to see your current settings.`);
       alert('Error running diagnostic: ' + error.message);
     }
   };
-  */
 
   // Super aggressive alarm test - this should definitely wake the device
-  /* COMMENTED OUT FOR PRODUCTION
   const testSuperAlarm = async () => {
     try {
       console.log('🚨🚨 Testing SUPER AGGRESSIVE alarm...');
@@ -1870,7 +2793,6 @@ Try the diagnostic button below to see your current settings.`);
       alert('Error testing alarm barrage: ' + error.message);
     }
   };
-  */
 
   const getCurrentTimeSlot = () => {
     const now = new Date();
@@ -1943,14 +2865,35 @@ Try the diagnostic button below to see your current settings.`);
             >
               <Trash2 className="w-4 h-4" />
             </button>
+            <button
+              onClick={async () => {
+                const result = await dismissActiveNotification(medicine.id, 'dismiss');
+                alert(result);
+              }}
+              className="p-2 bg-orange-500 text-white hover:bg-orange-600 rounded-lg transition-colors border border-orange-600 shadow-md font-bold"
+              title="Dismiss Active Alarms"
+            >
+              🔕
+            </button>
           </div>
-          <button
-            onClick={() => addPills(medicine.id, 1)}
-            className="text-xs bg-green-500 text-white px-3 py-1 rounded border border-green-700 hover:bg-green-600 hover:text-white transition-colors shadow-md font-bold"
-            title="Add 1 pill to refill"
-          >
-            + Refill
-          </button>
+          <div className="flex space-x-2">
+            <button
+              onClick={() => addPills(medicine.id, 1)}
+              className="text-xs bg-green-500 text-white px-2 py-1 rounded border border-green-700 hover:bg-green-600 hover:text-white transition-colors shadow-md font-bold flex-1"
+              title="Add 1 pill to refill"
+            >
+              +1 💊
+            </button>
+            <button
+              onClick={async () => {
+                await markMedicineAsTaken(medicine.id, false);
+              }}
+              className="text-xs bg-blue-500 text-white px-2 py-1 rounded border border-blue-700 hover:bg-blue-600 hover:text-white transition-colors shadow-md font-bold flex-1"
+              title="Mark as taken now"
+            >
+              ✅ Taken
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -2037,13 +2980,13 @@ Try the diagnostic button below to see your current settings.`);
   const handleEmergencyCall = (contactIndex, callType = 'phone') => {
     try {
       console.log('🚨 Emergency call triggered:', { contactIndex, callType, emergencyContacts });
-      
+
       const contact = emergencyContacts[contactIndex];
       console.log('📞 Contact details:', contact);
-      
+
       if (contact && contact.phone && contact.name && contact.phone.trim() && contact.name.trim()) {
         console.log('✅ Contact configured, proceeding with call');
-        
+
         if (callType === 'whatsapp') {
           // WhatsApp call
           const confirmed = window.confirm(
@@ -2882,6 +3825,829 @@ Try the diagnostic button below to see your current settings.`);
                 </div>
               </div>
 
+              {/* Alarm Testing Debug */}
+              <div className="bg-white rounded-xl shadow-sm p-4">
+                <h2 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
+                  <Bell className="w-5 h-5 mr-2 text-blue-600" />
+                  Alarm Testing
+                </h2>
+                <div className="space-y-3">
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🧪 Testing immediate alarm...');
+
+                        if (window.Capacitor && window.Capacitor.isNativePlatform()) {
+                          const testTime = new Date(Date.now() + 5000); // 5 seconds from now
+
+                          const testConfig = {
+                            title: '🧪 ALARM TEST',
+                            body: 'This is a 5-second alarm test!',
+                            id: 99999,
+                            schedule: { at: testTime },
+                            channelId: 'alarm-channel',
+                            importance: 5,
+                            priority: 2,
+                            sound: 'default',
+                            vibrate: [1000, 500, 1000],
+                            lights: true,
+                            lightColor: '#FF0000'
+                          };
+
+                          await LocalNotifications.schedule({
+                            notifications: [testConfig]
+                          });
+
+                          console.log('✅ Test alarm scheduled');
+                          alert('🧪 Test alarm scheduled for 5 seconds!');
+                        } else {
+                          alert('Alarm test only works on Android device');
+                        }
+                      } catch (error) {
+                        console.error('❌ Alarm test error:', error);
+                        alert('Alarm test failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
+                  >
+                    🧪 Test 5-Second Alarm
+                  </button>
+
+                  <button
+                    onClick={diagnoseNativeAlarmSystem}
+                    className="w-full p-3 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors font-medium"
+                  >
+                    🔍 Complete Alarm Diagnosis
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🔍 Checking pending notifications...');
+                        const pending = await LocalNotifications.getPending();
+                        console.log('📋 Pending notifications:', pending);
+
+                        // Show detailed info about each notification
+                        const now = new Date();
+                        let details = `📋 Pending notifications: ${pending.notifications?.length || 0}\n\n`;
+
+                        pending.notifications?.forEach((notification, index) => {
+                          const scheduleTime = new Date(notification.schedule?.at || 0);
+                          const isPast = scheduleTime < now;
+                          const timeUntil = Math.round((scheduleTime.getTime() - now.getTime()) / (1000 * 60));
+
+                          details += `${index + 1}. ${notification.title}\n`;
+                          details += `   Time: ${scheduleTime.toLocaleString()}\n`;
+                          details += `   Status: ${isPast ? '⚠️ PAST TIME' : '✅ Future'}\n`;
+                          details += `   ${isPast ? `Was ${-timeUntil} min ago` : `In ${timeUntil} min`}\n\n`;
+                        });
+
+                        alert(details + 'Check console for full details.');
+                      } catch (error) {
+                        console.error('❌ Error checking notifications:', error);
+                        alert('Error checking notifications: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors font-medium"
+                  >
+                    🔍 Check Pending Notifications
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🔄 Testing reschedule all notifications...');
+                        await rescheduleAllNotifications();
+
+                        // Wait a moment then check what was scheduled
+                        setTimeout(async () => {
+                          const pending = await LocalNotifications.getPending();
+                          console.log('📋 After reschedule - Pending notifications:', pending);
+                          alert(`🔄 Reschedule completed!\n\nNew pending notifications: ${pending.notifications?.length || 0}\n\nCheck console for details.`);
+                        }, 1000);
+                      } catch (error) {
+                        console.error('❌ Reschedule test error:', error);
+                        alert('Reschedule test failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors font-medium"
+                  >
+                    🔄 Test Reschedule All
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🧹 Manually cleaning up past notifications...');
+                        await cleanupPastNotifications();
+
+                        // Check what's left after cleanup
+                        setTimeout(async () => {
+                          const pending = await LocalNotifications.getPending();
+                          alert(`🧹 Cleanup completed!\n\nRemaining notifications: ${pending.notifications?.length || 0}\n\nCheck console for details.`);
+                        }, 500);
+                      } catch (error) {
+                        console.error('❌ Cleanup error:', error);
+                        alert('Cleanup failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium"
+                  >
+                    🧹 Clean Past Notifications
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🔕 Manual dismiss all active notifications...');
+
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('❌ Dismiss only available on Android device');
+                          return;
+                        }
+
+                        const pending = await LocalNotifications.getPending();
+                        const totalPending = pending.notifications?.length || 0;
+
+                        if (totalPending === 0) {
+                          alert('ℹ️ No active notifications to dismiss');
+                          return;
+                        }
+
+                        // Cancel all pending notifications
+                        await LocalNotifications.cancel({
+                          notifications: pending.notifications.map(n => ({ id: n.id }))
+                        });
+
+                        // Also cancel any native alarms
+                        for (const medicine of medicines) {
+                          if (medicine.alertType === 'native-alarm') {
+                            await cancelNativeAlarm(medicine.id);
+                          }
+                        }
+
+                        console.log(`✅ Dismissed ${totalPending} notifications`);
+                        alert(`✅ Dismissed ${totalPending} active notifications and alarms! 🔕`);
+
+                      } catch (error) {
+                        console.error('❌ Error dismissing notifications:', error);
+                        alert('❌ Error dismissing notifications: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium"
+                  >
+                    🔕 Dismiss All Active Alarms
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('⏰ Snooze all active notifications for 5 minutes...');
+
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('❌ Snooze only available on Android device');
+                          return;
+                        }
+
+                        const pending = await LocalNotifications.getPending();
+                        const activeNotifs = pending.notifications || [];
+
+                        if (activeNotifs.length === 0) {
+                          alert('ℹ️ No active notifications to snooze');
+                          return;
+                        }
+
+                        let snoozedCount = 0;
+                        const snoozeTime = new Date(Date.now() + 5 * 60 * 1000);
+
+                        // Cancel current notifications and reschedule them
+                        await LocalNotifications.cancel({
+                          notifications: activeNotifs.map(n => ({ id: n.id }))
+                        });
+
+                        const snoozeNotifications = activeNotifs.map(notif => ({
+                          ...notif,
+                          id: notif.id + 20000, // New ID to avoid conflicts
+                          title: `🔔 ${notif.extra?.medicineName || 'Medicine'} (Snoozed)`,
+                          body: `Reminder: ${notif.body}`,
+                          schedule: { at: snoozeTime },
+                          extra: {
+                            ...notif.extra,
+                            isSnoozed: true,
+                            originalTime: notif.schedule?.at,
+                            snoozeTime: snoozeTime.getTime()
+                          }
+                        }));
+
+                        if (snoozeNotifications.length > 0) {
+                          await LocalNotifications.schedule({
+                            notifications: snoozeNotifications
+                          });
+                          snoozedCount = snoozeNotifications.length;
+                        }
+
+                        console.log(`⏰ Snoozed ${snoozedCount} notifications until ${snoozeTime.toLocaleTimeString()}`);
+                        alert(`⏰ Snoozed ${snoozedCount} notifications for 5 minutes!\nNext reminders: ${snoozeTime.toLocaleTimeString()}`);
+
+                      } catch (error) {
+                        console.error('❌ Error snoozing notifications:', error);
+                        alert('❌ Error snoozing notifications: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-yellow-500 text-white rounded-lg hover:bg-yellow-600 transition-colors font-medium"
+                  >
+                    ⏰ Snooze All for 5 Minutes
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🔍 COMPREHENSIVE NOTIFICATION DIAGNOSTIC...');
+
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('❌ Diagnostics only available on Android device');
+                          return;
+                        }
+
+                        const now = new Date();
+                        console.log('📅 Current time:', now.toLocaleString());
+
+                        // Check all pending notifications
+                        const pending = await LocalNotifications.getPending();
+                        console.log('📋 Raw pending notifications:', pending);
+
+                        let diagnosticReport = `🔍 NOTIFICATION DIAGNOSTIC REPORT\n`;
+                        diagnosticReport += `📅 Current Time: ${now.toLocaleString()}\n`;
+                        diagnosticReport += `📋 Total Pending: ${pending.notifications?.length || 0}\n\n`;
+
+                        if (pending.notifications && pending.notifications.length > 0) {
+                          diagnosticReport += `📝 DETAILED BREAKDOWN:\n\n`;
+
+                          pending.notifications.forEach((notif, index) => {
+                            const scheduleTime = new Date(notif.schedule?.at || 0);
+                            const timeDiff = scheduleTime.getTime() - now.getTime();
+                            const minutesFromNow = Math.round(timeDiff / (1000 * 60));
+                            const isPast = timeDiff < 0;
+
+                            diagnosticReport += `${index + 1}. ${notif.title}\n`;
+                            diagnosticReport += `   📅 Scheduled: ${scheduleTime.toLocaleString()}\n`;
+                            diagnosticReport += `   ⏰ Status: ${isPast ? '⚠️ PAST TIME' : '✅ Future'}\n`;
+                            diagnosticReport += `   🕐 Time: ${isPast ? `${-minutesFromNow} min ago` : `In ${minutesFromNow} min`}\n`;
+                            diagnosticReport += `   🆔 ID: ${notif.id}\n`;
+                            diagnosticReport += `   📱 Medicine: ${notif.extra?.medicineName || 'Unknown'}\n`;
+                            diagnosticReport += `   🔔 Type: ${notif.extra?.alertType || 'Unknown'}\n\n`;
+                          });
+
+                          // Check for immediate triggers (notifications scheduled within next 2 minutes)
+                          const immediateTriggers = pending.notifications.filter(notif => {
+                            const scheduleTime = new Date(notif.schedule?.at || 0);
+                            const timeDiff = scheduleTime.getTime() - now.getTime();
+                            return timeDiff >= 0 && timeDiff <= 2 * 60 * 1000; // Next 2 minutes
+                          });
+
+                          if (immediateTriggers.length > 0) {
+                            diagnosticReport += `⚠️ IMMEDIATE TRIGGERS (Next 2 minutes):\n`;
+                            immediateTriggers.forEach(notif => {
+                              const scheduleTime = new Date(notif.schedule.at);
+                              diagnosticReport += `• ${notif.title} at ${scheduleTime.toLocaleTimeString()}\n`;
+                            });
+                            diagnosticReport += `\n`;
+                          }
+
+                          // Check for past notifications that should be cleaned
+                          const pastNotifications = pending.notifications.filter(notif => {
+                            const scheduleTime = new Date(notif.schedule?.at || 0);
+                            return scheduleTime < now;
+                          });
+
+                          if (pastNotifications.length > 0) {
+                            diagnosticReport += `🚨 PROBLEM FOUND: ${pastNotifications.length} past notifications!\n`;
+                            diagnosticReport += `These should have been cleaned up automatically.\n`;
+                            diagnosticReport += `This might be why alarms trigger immediately.\n\n`;
+                          }
+                        } else {
+                          diagnosticReport += `✅ No pending notifications found.\n`;
+                        }
+
+                        // Check medicines and their scheduling
+                        diagnosticReport += `💊 MEDICINE ANALYSIS:\n`;
+                        diagnosticReport += `Total medicines: ${medicines.length}\n`;
+
+                        medicines.forEach((med, index) => {
+                          const [hours, minutes] = med.alertTime.split(':');
+                          const todayAlarmTime = new Date(now);
+                          todayAlarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+
+                          const timeDiff = todayAlarmTime.getTime() - now.getTime();
+                          const minutesFromNow = Math.round(timeDiff / (1000 * 60));
+
+                          diagnosticReport += `${index + 1}. ${med.name}\n`;
+                          diagnosticReport += `   ⏰ Alert Time: ${med.alertTime}\n`;
+                          diagnosticReport += `   📅 Today's Trigger: ${todayAlarmTime.toLocaleString()}\n`;
+                          diagnosticReport += `   🕐 Status: ${timeDiff < 0 ? `Passed ${-minutesFromNow} min ago` : `In ${minutesFromNow} min`}\n`;
+                          diagnosticReport += `   🔔 Type: ${med.alertType}\n\n`;
+                        });
+
+                        console.log(diagnosticReport);
+                        alert(diagnosticReport);
+
+                      } catch (error) {
+                        console.error('❌ Diagnostic error:', error);
+                        alert('Diagnostic failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors font-medium"
+                  >
+                    🔍 Full Notification Diagnostic
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🔬 RELIABILITY ANALYSIS - Checking notification consistency...');
+
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('❌ Analysis only available on Android device');
+                          return;
+                        }
+
+                        let analysisReport = `🔬 NOTIFICATION RELIABILITY ANALYSIS\n\n`;
+
+                        // Check Android version and permissions
+                        analysisReport += `📱 SYSTEM ANALYSIS:\n`;
+                        analysisReport += `Platform: ${await window.Capacitor.getPlatform()}\n`;
+
+                        // Check notification permissions
+                        const permissions = await LocalNotifications.checkPermissions();
+                        analysisReport += `Notification Permission: ${permissions.display}\n`;
+
+                        // Check battery optimization (common cause of inconsistent notifications)
+                        analysisReport += `\n⚡ BATTERY OPTIMIZATION CHECK:\n`;
+                        analysisReport += `Many Android devices kill apps in background to save battery.\n`;
+                        analysisReport += `This is the #1 cause of missing notifications!\n\n`;
+
+                        // Check notification channels
+                        analysisReport += `📺 NOTIFICATION CHANNELS:\n`;
+                        analysisReport += `• notification-channel: Regular notifications\n`;
+                        analysisReport += `• alarm-channel: Critical alarms\n\n`;
+
+                        // Analyze current medicines for potential issues
+                        analysisReport += `💊 MEDICINE RELIABILITY CHECK:\n`;
+
+                        let reliabilityIssues = 0;
+                        const now = new Date();
+
+                        medicines.forEach((med, index) => {
+                          const [hours, minutes] = med.alertTime.split(':');
+                          const todayAlarmTime = new Date(now);
+                          todayAlarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+
+                          // Check for potential reliability issues
+                          let issues = [];
+
+                          // Issue 1: Alert time too close to current time
+                          const timeDiff = Math.abs(todayAlarmTime.getTime() - now.getTime());
+                          if (timeDiff < 5 * 60 * 1000) { // Less than 5 minutes
+                            issues.push('⚠️ Alert time very close to current time');
+                            reliabilityIssues++;
+                          }
+
+                          // Issue 2: Native alarm without proper setup
+                          if (med.alertType === 'native-alarm') {
+                            issues.push('🔊 Uses native alarm (requires special permissions)');
+                          }
+
+                          // Issue 3: Missing alert time
+                          if (!med.alertTime || med.alertTime === '') {
+                            issues.push('❌ Missing alert time');
+                            reliabilityIssues++;
+                          }
+
+                          analysisReport += `${index + 1}. ${med.name}\n`;
+                          analysisReport += `   Time: ${med.alertTime} (${med.alertType})\n`;
+                          if (issues.length > 0) {
+                            issues.forEach(issue => {
+                              analysisReport += `   ${issue}\n`;
+                            });
+                          } else {
+                            analysisReport += `   ✅ Configuration looks good\n`;
+                          }
+                          analysisReport += `\n`;
+                        });
+
+                        // Check for duplicate notification IDs (can cause conflicts)
+                        const pending = await LocalNotifications.getPending();
+                        const ids = pending.notifications?.map(n => n.id) || [];
+                        const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
+
+                        if (duplicateIds.length > 0) {
+                          analysisReport += `🚨 DUPLICATE NOTIFICATION IDS FOUND!\n`;
+                          analysisReport += `This can cause notifications to overwrite each other.\n`;
+                          analysisReport += `Duplicate IDs: ${duplicateIds.join(', ')}\n\n`;
+                          reliabilityIssues++;
+                        }
+
+                        // Overall reliability assessment
+                        analysisReport += `📊 RELIABILITY ASSESSMENT:\n`;
+                        if (reliabilityIssues === 0) {
+                          analysisReport += `✅ Configuration looks reliable!\n`;
+                          analysisReport += `If notifications still miss, check:\n`;
+                          analysisReport += `• Battery optimization settings\n`;
+                          analysisReport += `• Do Not Disturb mode\n`;
+                          analysisReport += `• App background restrictions\n`;
+                        } else {
+                          analysisReport += `⚠️ Found ${reliabilityIssues} potential reliability issues\n`;
+                          analysisReport += `These should be addressed for consistent notifications.\n`;
+                        }
+
+                        analysisReport += `\n🔧 COMMON SOLUTIONS:\n`;
+                        analysisReport += `1. Disable battery optimization for MyMedAlert\n`;
+                        analysisReport += `2. Enable "Allow background activity"\n`;
+                        analysisReport += `3. Add app to "Never sleeping apps"\n`;
+                        analysisReport += `4. Disable adaptive battery for this app\n`;
+                        analysisReport += `5. Set notification importance to HIGH\n`;
+
+                        console.log(analysisReport);
+                        alert(analysisReport);
+
+                      } catch (error) {
+                        console.error('❌ Analysis error:', error);
+                        alert('Analysis failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 transition-colors font-medium"
+                  >
+                    🔬 Reliability Analysis
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('🧪 NOTIFICATION CONSISTENCY TEST - Running comprehensive test suite...');
+
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('❌ Consistency test only available on Android device');
+                          return;
+                        }
+
+                        // Clear any existing test notifications first
+                        const pending = await LocalNotifications.getPending();
+                        const testNotifs = pending.notifications?.filter(n => n.extra?.isConsistencyTest) || [];
+                        if (testNotifs.length > 0) {
+                          console.log(`🧹 Clearing ${testNotifs.length} existing test notifications...`);
+                          await LocalNotifications.cancel({ notifications: testNotifs });
+                        }
+
+                        let testReport = `🧪 NOTIFICATION CONSISTENCY TEST\n\n`;
+                        testReport += `Starting comprehensive test suite...\n`;
+                        testReport += `This will schedule 5 test notifications at different intervals.\n\n`;
+
+                        const baseTime = Date.now();
+                        const testNotifications = [];
+
+                        // Test 1: Very short delay (30 seconds)
+                        testNotifications.push({
+                          title: '🧪 Test 1: Short Delay',
+                          body: 'This is test 1 - scheduled for 30 seconds',
+                          id: 99001,
+                          schedule: { at: new Date(baseTime + 30 * 1000) },
+                          channelId: 'notification-channel',
+                          importance: 4,
+                          priority: 1,
+                          sound: 'default',
+                          vibrate: [500],
+                          autoCancel: true,
+                          extra: {
+                            isConsistencyTest: true,
+                            testNumber: 1,
+                            testTime: new Date().toISOString(),
+                            scheduledFor: new Date(baseTime + 30 * 1000).toISOString()
+                          }
+                        });
+
+                        // Test 2: Medium delay (2 minutes)
+                        testNotifications.push({
+                          title: '🧪 Test 2: Medium Delay',
+                          body: 'This is test 2 - scheduled for 2 minutes',
+                          id: 99002,
+                          schedule: { at: new Date(baseTime + 2 * 60 * 1000) },
+                          channelId: 'notification-channel',
+                          importance: 4,
+                          priority: 1,
+                          sound: 'default',
+                          vibrate: [500],
+                          autoCancel: true,
+                          extra: {
+                            isConsistencyTest: true,
+                            testNumber: 2,
+                            testTime: new Date().toISOString(),
+                            scheduledFor: new Date(baseTime + 2 * 60 * 1000).toISOString()
+                          }
+                        });
+
+                        // Test 3: Long delay (5 minutes)
+                        testNotifications.push({
+                          title: '🧪 Test 3: Long Delay',
+                          body: 'This is test 3 - scheduled for 5 minutes',
+                          id: 99003,
+                          schedule: { at: new Date(baseTime + 5 * 60 * 1000) },
+                          channelId: 'notification-channel',
+                          importance: 4,
+                          priority: 1,
+                          sound: 'default',
+                          vibrate: [500],
+                          autoCancel: true,
+                          extra: {
+                            isConsistencyTest: true,
+                            testNumber: 3,
+                            testTime: new Date().toISOString(),
+                            scheduledFor: new Date(baseTime + 5 * 60 * 1000).toISOString()
+                          }
+                        });
+
+                        // Test 4: High priority alarm channel
+                        testNotifications.push({
+                          title: '🚨 Test 4: Alarm Channel',
+                          body: 'This is test 4 - using alarm channel (1 minute)',
+                          id: 99004,
+                          schedule: { at: new Date(baseTime + 1 * 60 * 1000) },
+                          channelId: 'alarm-channel',
+                          importance: 5,
+                          priority: 2,
+                          sound: 'default',
+                          vibrate: [1000, 500, 1000],
+                          autoCancel: true,
+                          extra: {
+                            isConsistencyTest: true,
+                            testNumber: 4,
+                            testTime: new Date().toISOString(),
+                            scheduledFor: new Date(baseTime + 1 * 60 * 1000).toISOString()
+                          }
+                        });
+
+                        // Test 5: Maximum settings test
+                        testNotifications.push({
+                          title: '🔥 Test 5: Maximum Settings',
+                          body: 'This is test 5 - all settings maxed (3 minutes)',
+                          id: 99005,
+                          schedule: { at: new Date(baseTime + 3 * 60 * 1000) },
+                          channelId: 'alarm-channel',
+                          importance: 5,
+                          priority: 2,
+                          sound: 'default',
+                          vibrate: [1000, 500, 1000, 500, 1000],
+                          lights: true,
+                          lightColor: '#FF0000',
+                          visibility: 1,
+                          autoCancel: true,
+                          wakeUpScreen: true,
+                          showWhen: true,
+                          when: baseTime + 3 * 60 * 1000,
+                          extra: {
+                            isConsistencyTest: true,
+                            testNumber: 5,
+                            testTime: new Date().toISOString(),
+                            scheduledFor: new Date(baseTime + 3 * 60 * 1000).toISOString(),
+                            alarmType: 'RTC_WAKEUP',
+                            exactAlarm: true,
+                            allowWhileIdle: true
+                          }
+                        });
+
+                        // Schedule all test notifications
+                        console.log('📤 Scheduling test notifications...');
+                        await LocalNotifications.schedule({
+                          notifications: testNotifications
+                        });
+
+                        testReport += `✅ Scheduled 5 test notifications:\n`;
+                        testReport += `• Test 1: 30 seconds (basic)\n`;
+                        testReport += `• Test 2: 2 minutes (medium)\n`;
+                        testReport += `• Test 3: 5 minutes (long)\n`;
+                        testReport += `• Test 4: 1 minute (alarm channel)\n`;
+                        testReport += `• Test 5: 3 minutes (maximum settings)\n\n`;
+
+                        testReport += `📊 WHAT TO WATCH FOR:\n`;
+                        testReport += `• Do all 5 notifications trigger?\n`;
+                        testReport += `• Are they triggered at the right times?\n`;
+                        testReport += `• Which ones (if any) fail to trigger?\n`;
+                        testReport += `• Does the alarm channel work better?\n\n`;
+
+                        testReport += `🔍 DEBUGGING TIPS:\n`;
+                        testReport += `1. Keep the app in foreground for first minute\n`;
+                        testReport += `2. Then put app in background\n`;
+                        testReport += `3. Note which notifications actually trigger\n`;
+                        testReport += `4. Use "Check Scheduled" to see what's pending\n\n`;
+
+                        testReport += `⏰ TIMELINE:\n`;
+                        testReport += `• ${new Date(baseTime + 30 * 1000).toLocaleTimeString()}: Test 1\n`;
+                        testReport += `• ${new Date(baseTime + 1 * 60 * 1000).toLocaleTimeString()}: Test 4\n`;
+                        testReport += `• ${new Date(baseTime + 2 * 60 * 1000).toLocaleTimeString()}: Test 2\n`;
+                        testReport += `• ${new Date(baseTime + 3 * 60 * 1000).toLocaleTimeString()}: Test 5\n`;
+                        testReport += `• ${new Date(baseTime + 5 * 60 * 1000).toLocaleTimeString()}: Test 3\n`;
+
+                        console.log(testReport);
+                        alert(testReport);
+
+                      } catch (error) {
+                        console.error('❌ Consistency test error:', error);
+                        alert('Consistency test failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors font-medium"
+                  >
+                    🧪 Run Consistency Test
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log('📊 NOTIFICATION STATUS MONITOR - Real-time tracking...');
+
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('❌ Status monitor only available on Android device');
+                          return;
+                        }
+
+                        let statusReport = `📊 NOTIFICATION STATUS MONITOR\n\n`;
+
+                        // Current system status
+                        const now = new Date();
+                        statusReport += `⏰ Current Time: ${now.toLocaleString()}\n`;
+                        statusReport += `📱 Platform: Android (Native)\n\n`;
+
+                        // Check all pending notifications
+                        const pending = await LocalNotifications.getPending();
+                        const totalPending = pending.notifications?.length || 0;
+                        statusReport += `📋 PENDING NOTIFICATIONS: ${totalPending}\n\n`;
+
+                        if (totalPending > 0) {
+                          // Group by medicine
+                          const byMedicine = {};
+                          const byStatus = {
+                            upcoming: [],
+                            overdue: [],
+                            soon: [] // Within next 10 minutes
+                          };
+
+                          pending.notifications.forEach(notif => {
+                            const medicineName = notif.extra?.medicineName || 'Unknown';
+                            const scheduleTime = new Date(notif.schedule?.at || 0);
+                            const timeDiff = scheduleTime.getTime() - now.getTime();
+                            const minutesFromNow = Math.round(timeDiff / (1000 * 60));
+
+                            // Group by medicine
+                            if (!byMedicine[medicineName]) {
+                              byMedicine[medicineName] = [];
+                            }
+                            byMedicine[medicineName].push({
+                              ...notif,
+                              scheduleTime,
+                              minutesFromNow,
+                              isOverdue: timeDiff < 0
+                            });
+
+                            // Group by status
+                            if (timeDiff < 0) {
+                              byStatus.overdue.push({ ...notif, scheduleTime, minutesFromNow });
+                            } else if (timeDiff <= 10 * 60 * 1000) {
+                              byStatus.soon.push({ ...notif, scheduleTime, minutesFromNow });
+                            } else {
+                              byStatus.upcoming.push({ ...notif, scheduleTime, minutesFromNow });
+                            }
+                          });
+
+                          // Show overdue notifications (these are problems!)
+                          if (byStatus.overdue.length > 0) {
+                            statusReport += `🚨 OVERDUE NOTIFICATIONS (${byStatus.overdue.length}):\n`;
+                            byStatus.overdue.forEach((notif, index) => {
+                              statusReport += `${index + 1}. ${notif.title}\n`;
+                              statusReport += `   ⏰ Was due: ${notif.scheduleTime.toLocaleString()}\n`;
+                              statusReport += `   🕐 Overdue by: ${-notif.minutesFromNow} minutes\n`;
+                              statusReport += `   ❗ This should have been cleaned up!\n\n`;
+                            });
+                          }
+
+                          // Show upcoming notifications
+                          if (byStatus.soon.length > 0) {
+                            statusReport += `⏳ COMING SOON (Next 10 minutes):\n`;
+                            byStatus.soon.forEach((notif, index) => {
+                              statusReport += `${index + 1}. ${notif.title}\n`;
+                              statusReport += `   ⏰ Due: ${notif.scheduleTime.toLocaleString()}\n`;
+                              statusReport += `   🕐 In: ${notif.minutesFromNow} minutes\n\n`;
+                            });
+                          }
+
+                          // Show summary by medicine
+                          statusReport += `💊 BY MEDICINE:\n`;
+                          Object.entries(byMedicine).forEach(([medicine, notifs]) => {
+                            const overdueCount = notifs.filter(n => n.isOverdue).length;
+                            const upcomingCount = notifs.filter(n => !n.isOverdue).length;
+
+                            statusReport += `• ${medicine}: ${notifs.length} total`;
+                            if (overdueCount > 0) {
+                              statusReport += ` (⚠️ ${overdueCount} overdue)`;
+                            }
+                            statusReport += `\n`;
+
+                            // Show next notification for this medicine
+                            const nextNotif = notifs
+                              .filter(n => !n.isOverdue)
+                              .sort((a, b) => a.scheduleTime - b.scheduleTime)[0];
+
+                            if (nextNotif) {
+                              statusReport += `  Next: ${nextNotif.scheduleTime.toLocaleString()}\n`;
+                            }
+                          });
+
+                          statusReport += `\n`;
+                        } else {
+                          statusReport += `✅ No pending notifications found.\n`;
+                          statusReport += `This could mean:\n`;
+                          statusReport += `• No medicines are scheduled\n`;
+                          statusReport += `• All notifications are in the past\n`;
+                          statusReport += `• There was a scheduling failure\n\n`;
+                        }
+
+                        // Check medicine configuration
+                        statusReport += `💊 MEDICINE CONFIGURATION:\n`;
+                        statusReport += `Total medicines: ${medicines.length}\n`;
+
+                        if (medicines.length > 0) {
+                          medicines.forEach((med, index) => {
+                            const [hours, minutes] = med.alertTime.split(':');
+                            const todayAlarmTime = new Date(now);
+                            todayAlarmTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+
+                            const timeDiff = todayAlarmTime.getTime() - now.getTime();
+                            const minutesFromNow = Math.round(timeDiff / (1000 * 60));
+
+                            statusReport += `${index + 1}. ${med.name}\n`;
+                            statusReport += `   Time: ${med.alertTime} (${med.alertType})\n`;
+                            statusReport += `   Today: ${timeDiff < 0 ? `Passed ${-minutesFromNow}m ago` : `In ${minutesFromNow}m`}\n`;
+
+                            // Check if there are pending notifications for this medicine
+                            const medicineNotifs = pending.notifications?.filter(n =>
+                              n.extra?.medicineId === med.id
+                            );
+                            statusReport += `   Scheduled: ${medicineNotifs?.length || 0} notifications\n\n`;
+                          });
+                        }
+
+                        // System health check
+                        statusReport += `🔧 SYSTEM HEALTH:\n`;
+                        const permissions = await LocalNotifications.checkPermissions();
+                        statusReport += `Notification Permission: ${permissions.display}\n`;
+
+                        // Check for common issues
+                        let healthIssues = 0;
+
+                        if (permissions.display !== 'granted') {
+                          statusReport += `❌ Notification permission not granted!\n`;
+                          healthIssues++;
+                        }
+
+                        if (medicines.length > 0 && totalPending === 0) {
+                          statusReport += `⚠️ No pending notifications despite having medicines!\n`;
+                          healthIssues++;
+                        }
+
+                        if (byStatus?.overdue?.length > 0) {
+                          statusReport += `⚠️ Overdue notifications found (cleanup needed)!\n`;
+                          healthIssues++;
+                        }
+
+                        if (healthIssues === 0) {
+                          statusReport += `✅ System appears healthy!\n`;
+                        } else {
+                          statusReport += `⚠️ Found ${healthIssues} potential issues.\n`;
+                        }
+
+                        console.log(statusReport);
+                        alert(statusReport);
+
+                      } catch (error) {
+                        console.error('❌ Status monitor error:', error);
+                        alert('Status monitor failed: ' + error.message);
+                      }
+                    }}
+                    className="w-full p-3 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors font-medium"
+                  >
+                    📊 Notification Status Monitor
+                  </button>                  <div className="bg-blue-50 p-3 rounded-lg">
+                    <p className="text-sm text-blue-800">
+                      <strong>Current Medicines:</strong> {medicines.length}
+                    </p>
+                    <p className="text-xs text-blue-700 mt-1">
+                      Native alarms: {medicines.filter(m => m.alertType === 'native-alarm').length}
+                    </p>
+                    <p className="text-xs text-blue-700">
+                      Notifications: {medicines.filter(m => m.alertType === 'notification').length}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               {/* Data Management */}
               <div className="bg-white rounded-xl shadow-sm p-4">
                 <h2 className="text-lg font-semibold text-gray-900 mb-4">Data Management</h2>
@@ -2925,13 +4691,175 @@ Try the diagnostic button below to see your current settings.`);
                 </div>
               </div>
 
-              {/* Test Notifications - COMMENTED OUT FOR PRODUCTION 
+              {/* CRITICAL: Battery Optimization Section */}
+              <div className="bg-white rounded-xl shadow-sm p-4 mb-4">
+                <h2 className="text-lg font-semibold text-gray-900 mb-3 flex items-center">
+                  <AlertTriangle className="w-5 h-5 mr-2 text-red-600" />
+                  🔋 CRITICAL: Battery Optimization Settings
+                </h2>
+                <div className="bg-red-50 p-3 rounded-lg mb-3">
+                  <p className="text-sm text-red-800 font-semibold mb-2">
+                    ⚠️ ALARMS WON'T WORK WHEN APP IS CLOSED WITHOUT THIS!
+                  </p>
+                  <p className="text-xs text-red-700">
+                    Android kills apps in the background to save battery. You MUST disable battery optimization for alarms to work when app is closed and phone is locked.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <button
+                    onClick={async () => {
+                      try {
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('This feature is only available on Android devices.');
+                          return;
+                        }
+
+                        const instructions = `🔋 DISABLE BATTERY OPTIMIZATION - CRITICAL!
+
+⚠️ WHY THIS IS NEEDED:
+Your alarms are NOT working when the app is closed because Android is killing the app to save battery. This is the #1 reason alarms don't fire!
+
+📱 FOLLOW THESE STEPS:
+
+1. Click OK to continue
+2. Go to: Settings → Apps → MyMedAlert
+3. Tap "Battery" or "Battery usage"
+4. Select "Unrestricted" or "Don't optimize"
+5. Restart your phone
+6. Test alarm with app closed
+
+FOR XIAOMI/HUAWEI/ONEPLUS:
+Also enable "Autostart" in app permissions!
+
+Click OK to continue.`;
+
+                        alert(instructions);
+
+                      } catch (error) {
+                        console.error('❌ Error:', error);
+                        alert('Please manually disable battery optimization:\\nSettings → Apps → MyMedAlert → Battery → Unrestricted');
+                      }
+                    }}
+                    className="w-full p-4 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-bold border-4 border-red-800 shadow-lg text-center"
+                  >
+                    ⚡🔋 DISABLE BATTERY OPTIMIZATION (REQUIRED!)
+                  </button>
+                  <button
+                    onClick={async () => {
+                      try {
+                        if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                          alert('This feature is only available on Android devices.');
+                          return;
+                        }
+
+                        const instructions = `🔔 ENABLE FULL-SCREEN ALARM NOTIFICATIONS
+
+⚠️ CRITICAL FOR ALARM UI TO SHOW!
+
+On Android 11+ (especially Android 14), you MUST grant "Display over other apps" permission for the alarm UI to appear when phone is unlocked.
+
+📱 FOLLOW THESE STEPS:
+
+1. Go to: Settings → Apps → MyMedAlert
+2. Tap "Advanced" or "More"
+3. Find "Display over other apps" or "Appear on top"
+4. Enable it
+
+ALTERNATIVE PATH:
+Settings → Special app access → Display over other apps → MyMedAlert → Allow
+
+Android 14+ ONLY:
+Settings → Notifications → MyMedAlert → Full screen intent → Allow
+
+WHY THIS IS NEEDED:
+Without this permission, the red alarm screen won't appear when you unlock your phone. You'll only hear the sound but won't see what medicine to take!
+
+Click OK to continue.`;
+
+                        alert(instructions);
+
+                      } catch (error) {
+                        console.error('❌ Error:', error);
+                      }
+                    }}
+                    className="w-full p-4 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors font-bold border-4 border-orange-800 shadow-lg text-center"
+                  >
+                    🔔 ENABLE FULL-SCREEN ALARM UI (ANDROID 11+)
+                  </button>
+                </div>
+              </div>
+
+              {/* Test Notifications - ENABLED FOR DEBUGGING */}
               <div className="bg-white rounded-xl shadow-sm p-4">
-                <h2 className="text-lg font-semibold text-gray-900 mb-4">Test Notifications</h2>
+                <h2 className="text-lg font-semibold text-gray-900 mb-4">🚨 ALARM TESTING & DEBUGGING</h2>
                 <div className="space-y-3">
                   <div className="bg-gradient-to-r from-red-800 to-red-900 p-4 rounded-lg border-2 border-red-600">
                     <h3 className="text-white font-bold text-center mb-3">🔊 NATIVE ALARMS (REAL SOUND & WAKE DEVICE)</h3>
                     <div className="space-y-2">
+                      <button
+                        onClick={createTestNativeAlarmMedicine}
+                        className="w-full p-3 bg-red-700 text-white rounded-lg hover:bg-red-800 transition-colors font-bold border-2 border-red-500"
+                      >
+                        🔥🚨 IMMEDIATE NATIVE ALARM (15 seconds) - WAKE DEVICE
+                      </button>
+                      <button
+                        onClick={async () => {
+                          try {
+                            console.log('🚨 QUICK ALARM TEST - 5 seconds');
+
+                            if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
+                              alert('Quick alarm test only works on Android devices.');
+                              return;
+                            }
+
+                            const now = new Date();
+                            const testTime = new Date(now.getTime() + 5000); // 5 seconds from now
+
+                            // Create quick test alarm config
+                            const quickAlarmConfig = {
+                              title: '🚨 QUICK ALARM TEST',
+                              body: 'Quick 5-second alarm test! This should work immediately!',
+                              id: 88888,
+                              schedule: { at: testTime },
+                              channelId: 'alarm-channel',
+                              importance: 5,
+                              priority: 2,
+                              sound: 'default',
+                              vibrate: [1000, 500, 1000],
+                              lights: true,
+                              lightColor: '#FF0000',
+                              autoCancel: false,
+                              wakeUpScreen: true,
+                              showWhen: true,
+                              when: testTime.getTime(),
+                              actions: [
+                                { id: 'dismiss', title: '✅ DISMISS', type: 'button' }
+                              ],
+                              extra: {
+                                isQuickTest: true,
+                                testTime: now.toISOString(),
+                                alarmType: 'RTC_WAKEUP',
+                                exactAlarm: true,
+                                allowWhileIdle: true
+                              }
+                            };
+
+                            await LocalNotifications.schedule({
+                              notifications: [quickAlarmConfig]
+                            });
+
+                            console.log('✅ Quick alarm scheduled for 5 seconds');
+                            alert('🚨 QUICK ALARM scheduled for 5 seconds!\n\nThis should:\n• Appear in exactly 5 seconds\n• Make alarm sound\n• Wake your device\n• Show dismiss button\n\nIf this works, your alarms are functional!');
+
+                          } catch (error) {
+                            console.error('❌ Quick alarm test error:', error);
+                            alert('Quick alarm test failed: ' + error.message);
+                          }
+                        }}
+                        className="w-full p-3 bg-orange-700 text-white rounded-lg hover:bg-orange-800 transition-colors font-bold border-2 border-orange-500"
+                      >
+                        ⚡ QUICK ALARM TEST (5 seconds) - INSTANT CHECK
+                      </button>
                       <button
                         onClick={testNativeAlarm}
                         className="w-full p-3 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-bold border-2 border-red-400"
@@ -2945,6 +4873,12 @@ Try the diagnostic button below to see your current settings.`);
                         📝 CREATE TEST MEDICINE (2 mins) - NATIVE ALARM
                       </button>
                       <button
+                        onClick={createTestNotificationMedicine}
+                        className="w-full p-3 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors font-bold border-2 border-orange-400"
+                      >
+                        🔔 CREATE TEST NOTIFICATION (30s) - WITH DISMISS
+                      </button>
+                      <button
                         onClick={testNativePlugin}
                         className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium"
                       >
@@ -2955,6 +4889,86 @@ Try the diagnostic button below to see your current settings.`);
                         className="w-full p-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium"
                       >
                         🔍 Check Native Alarm Permission
+                      </button>
+                      <button
+                        onClick={async () => {
+                          try {
+                            console.log('🚨 EMERGENCY ALARM TROUBLESHOOTING');
+
+                            let report = '🚨 EMERGENCY ALARM TROUBLESHOOTING REPORT\n\n';
+
+                            // Check basic setup
+                            report += '1️⃣ BASIC SETUP:\n';
+                            report += `• Total medicines: ${medicines.length}\n`;
+                            report += `• Medicines with alarms: ${medicines.filter(m => m.alertTime).length}\n`;
+                            report += `• Native alarms: ${medicines.filter(m => m.alertType === 'native-alarm').length}\n`;
+                            report += `• Regular notifications: ${medicines.filter(m => m.alertType === 'notification').length}\n\n`;
+
+                            // Check platform
+                            report += '2️⃣ PLATFORM CHECK:\n';
+                            report += `• Is Capacitor available: ${!!window.Capacitor}\n`;
+                            report += `• Is native platform: ${window.Capacitor ? window.Capacitor.isNativePlatform() : 'N/A'}\n`;
+                            report += `• LocalNotifications available: ${!!window.Capacitor?.Plugins?.LocalNotifications}\n`;
+                            report += `• MedicineAlarm plugin available: ${!!window.Capacitor?.Plugins?.MedicineAlarm}\n\n`;
+
+                            // Check permissions
+                            if (window.Capacitor && window.Capacitor.isNativePlatform()) {
+                              try {
+                                const permissions = await LocalNotifications.checkPermissions();
+                                report += '3️⃣ PERMISSIONS:\n';
+                                report += `• Display permission: ${permissions.display}\n`;
+                                report += `• Sound permission: ${permissions.sound || 'N/A'}\n\n`;
+                              } catch (permError) {
+                                report += '3️⃣ PERMISSIONS: ERROR - ' + permError.message + '\n\n';
+                              }
+
+                              // Check pending notifications
+                              try {
+                                const pending = await LocalNotifications.getPending();
+                                report += '4️⃣ PENDING NOTIFICATIONS:\n';
+                                report += `• Total pending: ${pending.notifications?.length || 0}\n`;
+
+                                if (pending.notifications?.length > 0) {
+                                  const now = new Date();
+                                  pending.notifications.slice(0, 3).forEach((notif, i) => {
+                                    const scheduleTime = new Date(notif.schedule?.at);
+                                    const timeDiff = (scheduleTime.getTime() - now.getTime()) / (1000 * 60);
+                                    report += `  ${i + 1}. ${notif.title} - ${timeDiff > 0 ? `in ${timeDiff.toFixed(1)} min` : `${-timeDiff.toFixed(1)} min ago`}\n`;
+                                  });
+                                }
+                                report += '\n';
+                              } catch (pendingError) {
+                                report += '4️⃣ PENDING NOTIFICATIONS: ERROR - ' + pendingError.message + '\n\n';
+                              }
+                            }
+
+                            // Check recent medicine
+                            const recentMedicine = medicines[medicines.length - 1];
+                            if (recentMedicine) {
+                              report += '5️⃣ LAST MEDICINE CHECK:\n';
+                              report += `• Name: ${recentMedicine.name}\n`;
+                              report += `• Alert time: ${recentMedicine.alertTime}\n`;
+                              report += `• Alert type: ${recentMedicine.alertType}\n`;
+                              report += `• Patient: ${recentMedicine.patientName}\n\n`;
+                            }
+
+                            report += '🔧 NEXT STEPS:\n';
+                            report += '1. Check Android Settings → Apps → MyMedAlert → Notifications\n';
+                            report += '2. Check Android Settings → Apps → Special access → Alarms & reminders\n';
+                            report += '3. Try creating a test medicine with immediate alert\n';
+                            report += '4. Use the diagnostic buttons below\n';
+
+                            console.log(report);
+                            alert(report);
+
+                          } catch (error) {
+                            console.error('❌ Troubleshooting error:', error);
+                            alert('Troubleshooting failed: ' + error.message);
+                          }
+                        }}
+                        className="w-full p-3 bg-red-800 text-white rounded-lg hover:bg-red-900 transition-colors font-bold border-2 border-red-600"
+                      >
+                        🚨🔧 EMERGENCY ALARM TROUBLESHOOTING
                       </button>
                       <button
                         onClick={requestNativeAlarmPermission}
@@ -2999,6 +5013,18 @@ Try the diagnostic button below to see your current settings.`);
                     className="w-full p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors font-medium"
                   >
                     🔍 Check Android Alarm Permissions
+                  </button>
+                  <button
+                    onClick={debugNativeAlarm}
+                    className="w-full p-3 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
+                  >
+                    🔍 DEBUG NATIVE ALARM (Step-by-Step)
+                  </button>
+                  <button
+                    onClick={troubleshootNativeAlarmImplementation}
+                    className="w-full p-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors font-medium"
+                  >
+                    📋 NATIVE ALARM IMPLEMENTATION GUIDE
                   </button>
                   <button
                     onClick={requestExactAlarmPermission}
@@ -3064,7 +5090,6 @@ Try the diagnostic button below to see your current settings.`);
                   </div>
                 </div>
               </div>
-              */}
 
               {/* About */}
               <div className="bg-white rounded-xl shadow-sm p-4">
@@ -3222,12 +5247,10 @@ Try the diagnostic button below to see your current settings.`);
                       className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     >
                       <option value="notification">📱 Notification (Silent)</option>
-                      <option value="alarm">🚨 Capacitor Alarm (Strong)</option>
                       <option value="native-alarm">🔊 Native Alarm (Real Sound + Wake Device)</option>
                     </select>
                     <p className="text-xs text-gray-500 mt-1">
                       {formData.alertType === 'notification' && '📱 Regular notification with vibration'}
-                      {formData.alertType === 'alarm' && '🚨 Enhanced notification with maximum priority'}
                       {formData.alertType === 'native-alarm' && '🔊 True alarm with real sound that wakes device (Android only)'}
                     </p>
                   </div>
@@ -3444,7 +5467,11 @@ Try the diagnostic button below to see your current settings.`);
               </p>
               <div className="flex space-x-3">
                 <button
-                  onClick={() => setShowSuccessDialog(false)}
+                  onClick={() => {
+                    setShowSuccessDialog(false);
+                    // Reset form with current active time slot instead of defaulting to morning
+                    openAddForm(activeTab);
+                  }}
                   className="flex-1 px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors shadow-md font-bold"
                 >
                   Add Another

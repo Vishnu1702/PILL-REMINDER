@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.Ringtone;
@@ -19,12 +20,70 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Vibrator;
 import android.util.Log;
+import android.content.IntentFilter;
 import androidx.core.app.NotificationCompat;
 
 public class AlarmService extends Service {
     private static final String TAG = "AlarmService";
     private static final String CHANNEL_ID = "MEDICINE_ALARM_CHANNEL";
     private static final int NOTIFICATION_ID = 12345;
+    private static final String PREFS_NAME = "AlarmPrefs";
+    private static final String KEY_ALARM_ACTIVE = "isAlarmActive";
+    private static final String KEY_MEDICINE_NAME = "medicineName";
+    private static final String KEY_DOSAGE = "dosage";
+    private static final String KEY_PATIENT_NAME = "patientName";
+    
+    // CRITICAL: Static flag to track if alarm is currently active
+    // This is used by MainActivity to check if it should show AlarmActivity
+    public static boolean isAlarmActive = false;
+    public static String currentMedicineName = "";
+    public static String currentDosage = "";
+    public static String currentPatientName = "";
+    
+    // Screen on receiver for lock screen detection
+    private ScreenOnReceiver screenOnReceiver;
+    
+    // Helper methods to persist alarm state using SharedPreferences
+    public static void setAlarmActive(Context context, boolean active, String medicineName, String dosage, String patientName) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = prefs.edit();
+        editor.putBoolean(KEY_ALARM_ACTIVE, active);
+        editor.putString(KEY_MEDICINE_NAME, medicineName != null ? medicineName : "");
+        editor.putString(KEY_DOSAGE, dosage != null ? dosage : "");
+        editor.putString(KEY_PATIENT_NAME, patientName != null ? patientName : "");
+        editor.apply();
+        
+        // Also update static variables
+        isAlarmActive = active;
+        currentMedicineName = medicineName != null ? medicineName : "";
+        currentDosage = dosage != null ? dosage : "";
+        currentPatientName = patientName != null ? patientName : "";
+        
+        Log.d(TAG, "Alarm state saved to SharedPreferences: active=" + active);
+    }
+    
+    public static boolean isAlarmActiveFromPrefs(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        boolean active = prefs.getBoolean(KEY_ALARM_ACTIVE, false);
+        // Also sync static variables
+        if (active) {
+            isAlarmActive = true;
+            currentMedicineName = prefs.getString(KEY_MEDICINE_NAME, "");
+            currentDosage = prefs.getString(KEY_DOSAGE, "");
+            currentPatientName = prefs.getString(KEY_PATIENT_NAME, "");
+        }
+        return active;
+    }
+    
+    public static void clearAlarmState(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        prefs.edit().clear().apply();
+        isAlarmActive = false;
+        currentMedicineName = "";
+        currentDosage = "";
+        currentPatientName = "";
+        Log.d(TAG, "Alarm state cleared from SharedPreferences");
+    }
     
     private Ringtone ringtone;
     private Vibrator vibrator;
@@ -51,6 +110,20 @@ public class AlarmService extends Service {
             PowerManager.PARTIAL_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
             "MedicineAlarm::WakeLock"
         );
+        
+        // CRITICAL: Register ScreenOnReceiver dynamically
+        // This catches SCREEN_ON events (even on lock screen) to show alarm
+        try {
+            screenOnReceiver = new ScreenOnReceiver();
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_SCREEN_ON);
+            filter.addAction(Intent.ACTION_USER_PRESENT);
+            filter.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
+            registerReceiver(screenOnReceiver, filter);
+            Log.d(TAG, "✅ ScreenOnReceiver registered successfully");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to register ScreenOnReceiver: " + e.getMessage());
+        }
     }
     
     @Override
@@ -79,6 +152,9 @@ public class AlarmService extends Service {
             String dosage = intent.getStringExtra("dosage");
             String patientName = intent.getStringExtra("patientName");
             
+            // CRITICAL: Save alarm state to SharedPreferences (persists across process restarts)
+            setAlarmActive(this, true, medicineName, dosage, patientName);
+            
             // CRITICAL: Start foreground service IMMEDIATELY to prevent crash
             // This MUST be the first operation to avoid Android 8+ crash
             try {
@@ -99,24 +175,31 @@ public class AlarmService extends Service {
                 Log.e(TAG, "Failed to acquire wake lock: " + e.getMessage());
             }
             
-            // Launch full-screen alarm activity immediately
+            // Play alarm sound IMMEDIATELY
+            playAlarmSound();
+            
+            // Start vibration IMMEDIATELY
+            startVibration();
+            
+            // CRITICAL: Launch full-screen alarm activity IMMEDIATELY (no delay)
+            // Launch directly to ensure it appears on top even when phone is unlocked
             try {
                 Intent alarmActivityIntent = new Intent(this, AlarmActivity.class);
-                alarmActivityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                // CRITICAL FLAGS: These ensure AlarmActivity appears ON TOP of everything
+                // Use NEW_TASK | CLEAR_TASK to start fresh in isolated task
+                alarmActivityIntent.setFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK |
+                    Intent.FLAG_ACTIVITY_CLEAR_TASK
+                );
                 alarmActivityIntent.putExtra("medicineName", medicineName);
                 alarmActivityIntent.putExtra("dosage", dosage);
                 alarmActivityIntent.putExtra("patientName", patientName);
                 startActivity(alarmActivityIntent);
-                Log.d(TAG, "Full-screen alarm activity launched");
+                Log.d(TAG, "✅ Full-screen alarm activity launched IMMEDIATELY with matching flags");
             } catch (Exception e) {
-                Log.e(TAG, "Failed to launch alarm activity: " + e.getMessage());
+                Log.e(TAG, "❌ CRITICAL: Failed to launch alarm activity: " + e.getMessage());
+                e.printStackTrace();
             }
-            
-            // Play alarm sound
-            playAlarmSound();
-            
-            // Start vibration
-            startVibration();
             
             // Stop alarm after 60 seconds
             stopAlarmRunnable = () -> {
@@ -190,30 +273,54 @@ public class AlarmService extends Service {
     
     private Notification createAlarmNotification(String medicineName, String dosage, String patientName) {
         try {
-            // Create intent for full-screen alarm activity
+            // Create intent for full-screen alarm activity with ALL necessary flags
             Intent alarmActivityIntent = new Intent(this, AlarmActivity.class);
-            alarmActivityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            // CRITICAL: These flags ensure AlarmActivity appears ON TOP of main app when unlocking
+            // Removed FLAG_ACTIVITY_NO_HISTORY to prevent activity from disappearing on unlock
+            alarmActivityIntent.setFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK |
+                Intent.FLAG_ACTIVITY_CLEAR_TASK
+            );
             alarmActivityIntent.putExtra("medicineName", medicineName);
             alarmActivityIntent.putExtra("dosage", dosage);
             alarmActivityIntent.putExtra("patientName", patientName);
             
-            // Use FLAG_IMMUTABLE for Android 12+ compatibility
+            // CRITICAL: Use FLAG_MUTABLE for clickable notifications on Android 12+
+            // FLAG_IMMUTABLE prevents the intent from being triggered!
             int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                flags |= PendingIntent.FLAG_IMMUTABLE;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                // Android 12+ needs FLAG_MUTABLE for notification actions to work
+                flags |= PendingIntent.FLAG_MUTABLE;
             }
             
-            PendingIntent alarmActivityPendingIntent = PendingIntent.getActivity(this, 0, alarmActivityIntent, flags);
+            // Create unique request code using timestamp to avoid conflicts
+            int requestCode = (int) System.currentTimeMillis();
+            PendingIntent alarmActivityPendingIntent = PendingIntent.getActivity(
+                this, 
+                requestCode, 
+                alarmActivityIntent, 
+                flags
+            );
             
-            // Create dismiss alarm intent
+            // Create dismiss alarm intent with proper flags
             Intent dismissIntent = new Intent(this, AlarmService.class);
             dismissIntent.setAction("DISMISS_ALARM");
-            PendingIntent dismissPendingIntent = PendingIntent.getService(this, 1, dismissIntent, flags);
+            PendingIntent dismissPendingIntent = PendingIntent.getService(
+                this, 
+                requestCode + 1, 
+                dismissIntent, 
+                flags
+            );
             
-            // Create snooze alarm intent (optional)
+            // Create snooze alarm intent with proper flags
             Intent snoozeIntent = new Intent(this, AlarmService.class);
             snoozeIntent.setAction("SNOOZE_ALARM");
-            PendingIntent snoozePendingIntent = PendingIntent.getService(this, 2, snoozeIntent, flags);
+            PendingIntent snoozePendingIntent = PendingIntent.getService(
+                this, 
+                requestCode + 2, 
+                snoozeIntent, 
+                flags
+            );
             
             // Safe string handling with null checks
             String safeMedicineName = (medicineName != null && !medicineName.isEmpty()) ? medicineName : "Medicine";
@@ -234,24 +341,30 @@ public class AlarmService extends Service {
             NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(content)
-                .setStyle(new NotificationCompat.BigTextStyle().bigText(bigText)) // Show detailed info
-                .setSmallIcon(android.R.drawable.ic_dialog_alert) // Using built-in Android icon
-                .setContentIntent(alarmActivityPendingIntent) // Launch full-screen alarm activity
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(bigText))
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                // CRITICAL: Make notification launch activity when tapped
+                .setContentIntent(alarmActivityPendingIntent)
+                .setFullScreenIntent(alarmActivityPendingIntent, true)
+                // High priority and visibility settings
                 .setPriority(NotificationCompat.PRIORITY_MAX)
                 .setCategory(NotificationCompat.CATEGORY_ALARM)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setOngoing(true) // Keep notification persistent
-                .setAutoCancel(false) // Don't auto-dismiss
-                .setFullScreenIntent(alarmActivityPendingIntent, true) // Full-screen alert for critical alarms
+                // Make notification persistent and require user action
+                .setOngoing(true)
+                .setAutoCancel(false)
+                // Visual and audio settings
                 .setDefaults(NotificationCompat.DEFAULT_ALL)
-                .setColor(0xFFFF0000) // Red color for alarm urgency
-                .setTicker("Medicine Alarm: " + safeMedicineName) // Show ticker text
-                .setWhen(System.currentTimeMillis()) // Set current time
-                .setShowWhen(true) // Show the time
+                .setColor(0xFFFF0000)
+                .setColorized(true) // Make entire notification red
+                .setTicker("Medicine Alarm: " + safeMedicineName)
+                .setWhen(System.currentTimeMillis())
+                .setShowWhen(true)
                 .setUsesChronometer(false)
-                // Add action buttons for user interaction
-                .addAction(android.R.drawable.ic_delete, "DISMISS", dismissPendingIntent)
-                .addAction(android.R.drawable.ic_media_pause, "SNOOZE (5 min)", snoozePendingIntent);
+                .setTimeoutAfter(60000) // Auto-dismiss after 60 seconds if not acted upon
+                // Add action buttons
+                .addAction(android.R.drawable.ic_delete, "✕ DISMISS", dismissPendingIntent)
+                .addAction(android.R.drawable.ic_media_pause, "⏰ SNOOZE 5 MIN", snoozePendingIntent);
             
             Notification notification = builder.build();
             
@@ -493,6 +606,9 @@ public class AlarmService extends Service {
     private void stopAlarm() {
         Log.d(TAG, "Stopping alarm service");
         
+        // CRITICAL: Clear alarm state from SharedPreferences (persists across process restarts)
+        clearAlarmState(this);
+        
         // Remove any pending stop callback
         try {
             if (stopAlarmRunnable != null && handler != null) {
@@ -556,6 +672,18 @@ public class AlarmService extends Service {
     @Override
     public void onDestroy() {
         Log.d(TAG, "AlarmService onDestroy");
+        
+        // Unregister ScreenOnReceiver
+        try {
+            if (screenOnReceiver != null) {
+                unregisterReceiver(screenOnReceiver);
+                screenOnReceiver = null;
+                Log.d(TAG, "ScreenOnReceiver unregistered");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error unregistering ScreenOnReceiver: " + e.getMessage());
+        }
+        
         try {
             stopAlarm();
         } catch (Exception e) {

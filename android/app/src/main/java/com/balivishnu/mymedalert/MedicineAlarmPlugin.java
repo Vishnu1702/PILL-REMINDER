@@ -31,16 +31,19 @@ public class MedicineAlarmPlugin extends Plugin {
 
             Context context = getContext();
             
-            // Create intent for AlarmService
-            Intent serviceIntent = new Intent(context, AlarmService.class);
-            serviceIntent.putExtra("medicineName", medicineName); // Match AlarmService field names
-            serviceIntent.putExtra("dosage", dosage);
-            serviceIntent.putExtra("patientName", patientName);
+            // CRITICAL FIX: Create intent for AlarmReceiver (BroadcastReceiver)
+            // This is the ONLY way alarms work when app is closed!
+            Intent receiverIntent = new Intent(context, AlarmReceiver.class);
+            receiverIntent.putExtra("medicineName", medicineName);
+            receiverIntent.putExtra("dosage", dosage);
+            receiverIntent.putExtra("patientName", patientName);
 
-            PendingIntent pendingIntent = PendingIntent.getService(
+            // CRITICAL: Use getBroadcast instead of getService
+            // This allows alarm to fire even when app is completely closed
+            PendingIntent pendingIntent = PendingIntent.getBroadcast(
                     context,
                     alarmId,
-                    serviceIntent,
+                    receiverIntent,
                     PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
             );
 
@@ -80,11 +83,14 @@ public class MedicineAlarmPlugin extends Plugin {
 
             Context context = getContext();
             
-            Intent serviceIntent = new Intent(context, AlarmService.class);
-            PendingIntent pendingIntent = PendingIntent.getService(
+            // CRITICAL FIX: Create intent for AlarmReceiver (BroadcastReceiver)
+            Intent receiverIntent = new Intent(context, AlarmReceiver.class);
+            
+            // CRITICAL: Use getBroadcast instead of getService for cancellation
+            PendingIntent pendingIntent = PendingIntent.getBroadcast(
                     context,
                     alarmId,
-                    serviceIntent,
+                    receiverIntent,
                     PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
             );
 
