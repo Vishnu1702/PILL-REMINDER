@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2, Camera, Clock, Pill, Bell, Calendar, TrendingUp, AlertCircle, Check, X, BarChart3, Package, ChevronDown, ChevronRight, Settings, Info, Phone, AlertTriangle, Share2, Mic, MicOff, MessageCircle, MessageSquare, Mail, Copy, Printer, Home } from 'lucide-react';
+import { Plus, Edit2, Trash2, Camera, Clock, Pill, Bell, Calendar, TrendingUp, AlertCircle, Check, X, BarChart3, Package, ChevronDown, ChevronRight, Settings, Info, Phone, AlertTriangle, Share2, Mic, MicOff, MessageCircle, MessageSquare, Mail, Copy, Printer, Home, AudioWaveform, BotMessageSquare } from 'lucide-react';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import PrivacyPolicy from './PrivacyPolicy';
 
@@ -34,6 +34,7 @@ const MedicineReminderApp = () => {
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceResponse, setVoiceResponse] = useState('');
   const [showVoiceDialog, setShowVoiceDialog] = useState(false);
+  const [currentTime, setCurrentTime] = useState(new Date());
   const [shareSelection, setShareSelection] = useState({}); // for selecting medicines to share
   const [formData, setFormData] = useState({
     patientName: '', // new field
@@ -135,6 +136,14 @@ const MedicineReminderApp = () => {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.dosageHistory, JSON.stringify(dosageHistory));
   }, [dosageHistory]);
+
+  // Update current time every minute
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Request notification permissions and create channels on mount
   useEffect(() => {
@@ -3392,12 +3401,8 @@ Try the diagnostic button below to see your current settings.`);
     }
 
     try {
-      // Request microphone permission first
-      setVoiceResponse('🎤 Requesting microphone permission...');
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      // Stop the stream immediately as we just needed permission
-      stream.getTracks().forEach(track => track.stop());
+      // Let SpeechRecognition handle permissions directly - better for mobile/Capacitor
+      setVoiceResponse('🎤 Starting voice recognition...');
 
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       const recognition = new SpeechRecognition();
@@ -3466,45 +3471,237 @@ Try the diagnostic button below to see your current settings.`);
         setVoiceResponse(`❌ Error accessing microphone: ${error.message}`);
       }
     }
-  }; const processVoiceCommand = (command) => {
+  }; const processVoiceCommand = async (command) => {
     const lowerCommand = command.toLowerCase();
     let response = '';
 
     try {
-      // Check what medicines to take now
-      if (lowerCommand.includes('what medicine') || lowerCommand.includes('what medication') ||
-        lowerCommand.includes('medicine now') || lowerCommand.includes('take now')) {
+      // === ADD MEDICINE BY VOICE ===
+      // Pattern: "add medicine [name] for [time]" or "add [name] for [patient] in the [time]"
+      if (lowerCommand.includes('add medicine') || lowerCommand.includes('add a medicine') || 
+          (lowerCommand.includes('add') && (lowerCommand.includes('morning') || lowerCommand.includes('afternoon') || 
+           lowerCommand.includes('evening') || lowerCommand.includes('night')))) {
+        
+        // Extract medicine name - look for patterns like "add medicine X" or "add X for"
+        let medicineName = '';
+        let timeSlot = 'morning';
+        let patientName = '';
+        
+        // Determine time slot
+        if (lowerCommand.includes('morning')) timeSlot = 'morning';
+        else if (lowerCommand.includes('afternoon')) timeSlot = 'afternoon';
+        else if (lowerCommand.includes('evening')) timeSlot = 'evening';
+        else if (lowerCommand.includes('night')) timeSlot = 'night';
+        
+        // Extract medicine name
+        const addMatch = lowerCommand.match(/add(?:\s+a)?\s+(?:medicine\s+)?(.+?)(?:\s+for|\s+in\s+the|\s+at|\s+to|$)/i);
+        if (addMatch && addMatch[1]) {
+          medicineName = addMatch[1].trim();
+          // Clean up common words
+          medicineName = medicineName.replace(/\b(morning|afternoon|evening|night|the|my|a|an)\b/gi, '').trim();
+        }
+        
+        // Extract patient name if mentioned "for [patient]"
+        const forMatch = lowerCommand.match(/for\s+(\w+)(?:\s+in|\s+at|$)/i);
+        if (forMatch && forMatch[1] && !['morning', 'afternoon', 'evening', 'night', 'the', 'me'].includes(forMatch[1].toLowerCase())) {
+          patientName = forMatch[1].charAt(0).toUpperCase() + forMatch[1].slice(1);
+        }
+        
+        if (medicineName && medicineName.length > 1) {
+          // Capitalize medicine name
+          medicineName = medicineName.split(' ').map(word => 
+            word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+          ).join(' ');
+          
+          // Create new medicine with defaults
+          const defaultTime = timeSlots[timeSlot]?.defaultTime || '08:00';
+          const newMedicine = {
+            id: Date.now().toString(),
+            patientName: patientName || 'General',
+            doctorName: '',
+            itemType: 'medicine',
+            name: medicineName,
+            dosage: '1',
+            dosageType: 'tablet',
+            customDosageType: '',
+            time: timeSlot,
+            color: '#3B82F6',
+            image: null,
+            notes: 'Added via voice command',
+            specificTime: defaultTime,
+            alertTime: calculateAlertTime(defaultTime),
+            alertType: 'notification',
+            totalPills: 30,
+            currentPills: 30,
+            refillReminder: 5,
+            frequency: 'daily',
+            frequencyDays: 2,
+            specificWeekDays: [],
+            reminderEndDate: '',
+            reminderDurationDays: ''
+          };
+          
+          // Add medicine
+          setMedicines(prev => [...prev, newMedicine]);
+          
+          // Schedule notification
+          scheduleLocalNotification(newMedicine);
+          
+          response = `✅ Added ${medicineName} for ${patientName || 'General'} in the ${timeSlot} at ${defaultTime}. You can edit it to adjust dosage and other details.`;
+        } else {
+          response = `I heard "add medicine" but couldn't understand the name. Please say something like "Add medicine Aspirin for morning" or "Add Paracetamol for evening".`;
+        }
+      }
+      
+      // === MARK MEDICINE AS TAKEN ===
+      // Pattern: "mark [medicine] as taken" or "took [medicine]" or "taken [medicine]"
+      else if (lowerCommand.includes('mark') && lowerCommand.includes('taken') ||
+               lowerCommand.includes('took ') || lowerCommand.includes('i took') ||
+               (lowerCommand.includes('taken') && !lowerCommand.includes('what'))) {
+        
+        // Extract medicine name
+        let medicineName = '';
+        const markMatch = lowerCommand.match(/(?:mark\s+)?(.+?)(?:\s+as)?\s+taken/i);
+        const tookMatch = lowerCommand.match(/(?:i\s+)?took\s+(?:my\s+)?(.+)/i);
+        
+        if (markMatch && markMatch[1]) {
+          medicineName = markMatch[1].replace(/\b(my|the|a|an)\b/gi, '').trim();
+        } else if (tookMatch && tookMatch[1]) {
+          medicineName = tookMatch[1].trim();
+        }
+        
+        if (medicineName) {
+          // Find matching medicine (case-insensitive partial match)
+          const matchedMed = medicines.find(med => 
+            med.name.toLowerCase().includes(medicineName.toLowerCase()) ||
+            medicineName.toLowerCase().includes(med.name.toLowerCase())
+          );
+          
+          if (matchedMed) {
+            // Mark as taken
+            await markMedicineAsTaken(matchedMed.id, false);
+            response = `✅ Marked ${matchedMed.name} as taken! Stock remaining: ${matchedMed.currentPills - 1} ${matchedMed.dosageType}s.`;
+          } else {
+            response = `❌ Couldn't find a medicine matching "${medicineName}". Your medicines are: ${medicines.map(m => m.name).join(', ')}`;
+          }
+        } else {
+          response = `Please specify which medicine. Say "Mark Aspirin as taken" or "I took my Paracetamol".`;
+        }
+      }
+      
+      // === TODAY'S COMPLETE SCHEDULE ===
+      // Pattern: "today's schedule" or "what's my schedule today" or "show today"
+      else if (lowerCommand.includes('today') || lowerCommand.includes('schedule') || 
+               lowerCommand.includes('full schedule') || lowerCommand.includes('complete schedule')) {
+        
+        if (medicines.length === 0) {
+          response = "You have no medicines scheduled. Add some medicines to get started!";
+        } else {
+          // Group by time slot
+          const scheduleByTime = {
+            morning: medicines.filter(m => m.time === 'morning'),
+            afternoon: medicines.filter(m => m.time === 'afternoon'),
+            evening: medicines.filter(m => m.time === 'evening'),
+            night: medicines.filter(m => m.time === 'night')
+          };
+          
+          let scheduleText = "📅 Today's complete schedule: ";
+          const parts = [];
+          
+          if (scheduleByTime.morning.length > 0) {
+            parts.push(`🌅 Morning: ${scheduleByTime.morning.map(m => `${m.name} at ${m.specificTime}`).join(', ')}`);
+          }
+          if (scheduleByTime.afternoon.length > 0) {
+            parts.push(`☀️ Afternoon: ${scheduleByTime.afternoon.map(m => `${m.name} at ${m.specificTime}`).join(', ')}`);
+          }
+          if (scheduleByTime.evening.length > 0) {
+            parts.push(`🌆 Evening: ${scheduleByTime.evening.map(m => `${m.name} at ${m.specificTime}`).join(', ')}`);
+          }
+          if (scheduleByTime.night.length > 0) {
+            parts.push(`🌙 Night: ${scheduleByTime.night.map(m => `${m.name} at ${m.specificTime}`).join(', ')}`);
+          }
+          
+          response = scheduleText + parts.join('. ');
+        }
+      }
+      
+      // === CHECK STOCK LEVELS ===
+      // Pattern: "check stock" or "stock levels" or "how many pills" or "low stock"
+      else if (lowerCommand.includes('stock') || lowerCommand.includes('pills left') || 
+               lowerCommand.includes('how many') || lowerCommand.includes('inventory') ||
+               lowerCommand.includes('refill') || lowerCommand.includes('running low')) {
+        
+        if (medicines.length === 0) {
+          response = "No medicines to check stock for.";
+        } else {
+          const lowStockMeds = medicines.filter(m => m.itemType !== 'non-medicine' && m.currentPills <= m.refillReminder);
+          const outOfStockMeds = medicines.filter(m => m.itemType !== 'non-medicine' && m.currentPills === 0);
+          
+          if (outOfStockMeds.length > 0) {
+            response = `🚨 OUT OF STOCK: ${outOfStockMeds.map(m => m.name).join(', ')}. `;
+          }
+          
+          if (lowStockMeds.length > 0 && lowStockMeds.length !== outOfStockMeds.length) {
+            const lowOnly = lowStockMeds.filter(m => m.currentPills > 0);
+            if (lowOnly.length > 0) {
+              response += `⚠️ Low stock: ${lowOnly.map(m => `${m.name} (${m.currentPills} left)`).join(', ')}. `;
+            }
+          }
+          
+          if (!response) {
+            // Show all stock levels
+            const stockInfo = medicines
+              .filter(m => m.itemType !== 'non-medicine')
+              .map(m => `${m.name}: ${m.currentPills}/${m.totalPills}`)
+              .join(', ');
+            response = `📦 Stock levels: ${stockInfo}`;
+          } else {
+            response += `All other medicines have sufficient stock.`;
+          }
+        }
+      }
+      
+      // === WHAT MEDICINE NOW / CURRENT TIME ===
+      else if (lowerCommand.includes('what medicine') || lowerCommand.includes('what medication') ||
+        lowerCommand.includes('medicine now') || lowerCommand.includes('take now') ||
+        lowerCommand.includes('what do i take') || lowerCommand.includes('what should i take')) {
         const currentMedicines = getCurrentMedicines();
         if (currentMedicines.length > 0) {
-          response = `You need to take: ${currentMedicines.map(med => `${med.name} (${med.dosage})`).join(', ')}`;
+          response = `You need to take: ${currentMedicines.map(med => `${med.name} (${med.dosage} ${med.dosageType})`).join(', ')}`;
         } else {
-          response = 'No medicines scheduled for right now. Great job staying on track!';
+          // Check what's coming up next
+          const upcomingMeds = getUpcomingMedicines();
+          if (upcomingMeds.length > 0) {
+            response = `No medicines right now. Next up: ${upcomingMeds[0].name} at ${upcomingMeds[0].nextTime}`;
+          } else {
+            response = 'No more medicines scheduled for today. Great job!';
+          }
         }
       }
-      // List all medicines
+      
+      // === LIST ALL MEDICINES ===
       else if (lowerCommand.includes('list') && (lowerCommand.includes('medicine') || lowerCommand.includes('medication'))) {
         if (medicines.length > 0) {
-          const medicineList = medicines.map(med => `${med.name} for ${med.patientName || 'you'}`).join(', ');
+          const medicineList = medicines.map(med => `${med.name} for ${med.patientName || 'General'}`).join(', ');
           response = `Your medicines are: ${medicineList}`;
         } else {
-          response = 'You have no medicines added yet.';
+          response = 'You have no medicines added yet. Say "Add medicine [name] for morning" to add one.';
         }
       }
-      // Check schedule
-      else if (lowerCommand.includes('schedule') || lowerCommand.includes('when')) {
-        const upcomingMeds = getUpcomingMedicines();
-        if (upcomingMeds.length > 0) {
-          response = `Your next medicines: ${upcomingMeds.slice(0, 3).map(med =>
-            `${med.name} at ${med.nextTime}`).join(', ')}`;
-        } else {
-          response = 'No upcoming medicines scheduled for today.';
-        }
-      }
-      // Help or general questions
+      
+      // === HELP ===
       else if (lowerCommand.includes('help') || lowerCommand.includes('what can you do')) {
-        response = 'I can help you with: "What medicine do I need now?", "List my medicines", "When is my next dose?", or "Show my schedule"';
+        response = `I can help you with: 
+          • "Add medicine Aspirin for morning" - Add a new medicine
+          • "Mark Aspirin as taken" or "I took Aspirin" - Mark as taken
+          • "Today's schedule" - See full daily schedule
+          • "Check stock" or "Low stock" - Check inventory levels
+          • "What medicine now?" - Current medicines to take
+          • "List my medicines" - List all medicines
+          • "Emergency contacts" - Show contacts`;
       }
-      // Emergency contacts
+      
+      // === EMERGENCY CONTACTS ===
       else if (lowerCommand.includes('emergency') || lowerCommand.includes('contact')) {
         const contacts = emergencyContacts.filter(c => c.name && c.phone);
         if (contacts.length > 0) {
@@ -3513,11 +3710,17 @@ Try the diagnostic button below to see your current settings.`);
           response = 'No emergency contacts configured. Please set them up in settings.';
         }
       }
-      // Default response
+      
+      // === DEFAULT RESPONSE ===
       else {
-        response = `I heard "${command}" but I'm not sure how to help with that. Try asking "What medicine do I need now?" or "List my medicines"`;
+        response = `I heard "${command}" but I'm not sure how to help. Say "Help" to see what I can do, or try:
+          • "Add medicine [name] for [morning/evening]"
+          • "Mark [medicine] as taken"
+          • "Today's schedule"
+          • "Check stock"`;
       }
     } catch (error) {
+      console.error('Voice command error:', error);
       response = 'Sorry, I encountered an error processing your request. Please try again.';
     }
 
@@ -3604,11 +3807,16 @@ Try the diagnostic button below to see your current settings.`);
                   MyMedAlert
                 </h1>
                 <p className="text-xs text-gray-500">Smart Medicine Reminder</p>
+                <p className="text-[10px] text-gray-400 mt-0.5">
+                  {currentTime.toLocaleDateString('en-US', { weekday: 'short' })}, {currentTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} • {currentTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
+                </p>
               </div>
             </div>
 
-            {/* Emergency and Action Buttons - All in one row */}
-            <div className="flex items-center space-x-1.5">
+            {/* Emergency and Action Buttons */}
+            <div className="flex flex-col items-end space-y-1">
+              {/* Row 1: Emergency Buttons */}
+              <div className="flex items-center space-x-1.5">
               {/* Emergency Button 1 - Phone */}
               <button
                 onClick={() => handleEmergencyCall(0, 'phone')}
@@ -3647,7 +3855,10 @@ Try the diagnostic button below to see your current settings.`);
                   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.890-5.335 11.893-11.893A11.821 11.821 0 0020.885 3.787" />
                 </svg>
               </button>
+              </div>
 
+              {/* Row 2: Share and Voice Assistant */}
+              <div className="flex items-center space-x-1.5">
               {/* Share Button */}
               <button
                 onClick={() => setShowSharingDialog(true)}
@@ -3661,13 +3872,14 @@ Try the diagnostic button below to see your current settings.`);
               <button
                 onClick={startVoiceListening}
                 className={`p-2 rounded-lg shadow-md transition-all text-white ${voiceListening
-                  ? 'bg-gradient-to-r from-purple-600 to-purple-700'
+                  ? 'bg-gradient-to-r from-purple-600 to-purple-700 animate-pulse'
                   : 'bg-gradient-to-r from-indigo-600 to-indigo-700'
                 }`}
                 title="Voice Assistant"
               >
-                {voiceListening ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                {voiceListening ? <AudioWaveform className="w-3.5 h-3.5" /> : <BotMessageSquare className="w-3.5 h-3.5" />}
               </button>
+              </div>
             </div>
           </div>
         </div>
@@ -5075,7 +5287,7 @@ Click OK to continue.`;
               {voiceListening ? (
                 <div className="flex flex-col items-center space-y-3">
                   <div className="w-16 h-16 bg-gradient-to-r from-purple-500 to-indigo-600 rounded-full flex items-center justify-center animate-pulse">
-                    <Mic className="w-8 h-8 text-white" />
+                    <AudioWaveform className="w-8 h-8 text-white" />
                   </div>
                   <div className="flex space-x-1">
                     <div className="w-2 h-2 bg-purple-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
@@ -5084,8 +5296,8 @@ Click OK to continue.`;
                   </div>
                 </div>
               ) : (
-                <div className="w-16 h-16 bg-gray-200 rounded-full flex items-center justify-center mx-auto">
-                  <MicOff className="w-8 h-8 text-gray-500" />
+                <div className="w-16 h-16 bg-gradient-to-r from-indigo-100 to-purple-100 rounded-full flex items-center justify-center mx-auto">
+                  <BotMessageSquare className="w-8 h-8 text-indigo-600" />
                 </div>
               )}
             </div>
@@ -5100,12 +5312,14 @@ Click OK to continue.`;
 
             <div className="space-y-3">
               <div className="bg-blue-50 p-3 rounded-lg">
-                <h4 className="font-medium text-blue-900 mb-2">Try asking:</h4>
+                <h4 className="font-medium text-blue-900 mb-2">Try saying:</h4>
                 <ul className="text-blue-800 text-sm space-y-1">
-                  <li>• "What medicine do I need to take now?"</li>
-                  <li>• "List all my medicines"</li>
-                  <li>• "When is my next dose?"</li>
-                  <li>• "Show my emergency contacts"</li>
+                  <li>• "Add medicine Aspirin for morning"</li>
+                  <li>• "Mark Paracetamol as taken"</li>
+                  <li>• "Today's schedule"</li>
+                  <li>• "Check stock" or "Low stock"</li>
+                  <li>• "What medicine do I take now?"</li>
+                  <li>• "Help" for all commands</li>
                 </ul>
               </div>
 
