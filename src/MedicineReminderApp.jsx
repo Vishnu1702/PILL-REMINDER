@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2, Camera, Clock, Pill, Bell, Calendar, TrendingUp, AlertCircle, Check, X, BarChart3, Package, ChevronDown, ChevronRight, Settings, Info, Phone, AlertTriangle, Share2, Mic, MicOff, MessageCircle, MessageSquare, Mail, Copy, Printer, Home, AudioWaveform, BotMessageSquare } from 'lucide-react';
+import { Plus, Edit2, Trash2, Camera, Clock, Pill, Bell, Calendar, TrendingUp, AlertCircle, Check, X, BarChart3, Package, ChevronDown, ChevronRight, ChevronLeft, Settings, Info, Phone, AlertTriangle, Share2, Mic, MicOff, MessageCircle, MessageSquare, Mail, Copy, Printer, Home, AudioWaveform, BotMessageSquare } from 'lucide-react';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import PrivacyPolicy from './PrivacyPolicy';
 
@@ -35,6 +35,8 @@ const MedicineReminderApp = () => {
   const [voiceResponse, setVoiceResponse] = useState('');
   const [showVoiceDialog, setShowVoiceDialog] = useState(false);
   const [currentTime, setCurrentTime] = useState(new Date());
+  const [selectedDate, setSelectedDate] = useState(new Date()); // For calendar date picker
+  const [showCalendar, setShowCalendar] = useState(false); // Show/hide calendar popup
   const [shareSelection, setShareSelection] = useState({}); // for selecting medicines to share
   const [formData, setFormData] = useState({
     patientName: '', // new field
@@ -65,7 +67,8 @@ const MedicineReminderApp = () => {
     morning: { label: 'Morning', icon: '🌅', time: '5:00 - 11:59', defaultTime: '08:00' },
     afternoon: { label: 'Afternoon', icon: '☀️', time: '12:00 - 15:59', defaultTime: '12:00' },
     evening: { label: 'Evening', icon: '🌆', time: '16:00 - 19:59', defaultTime: '16:00' },
-    night: { label: 'Night', icon: '🌙', time: '20:00 - 4:59', defaultTime: '20:00' }
+    night: { label: 'Night', icon: '🌙', time: '20:00 - 23:59', defaultTime: '20:00' },
+    midnight: { label: 'Midnight', icon: '🌌', time: '0:00 - 4:59', defaultTime: '00:30' }
   };
 
   const colorOptions = [
@@ -1250,10 +1253,11 @@ const MedicineReminderApp = () => {
   // Function to determine time slot based on specific time
   const getTimeSlotFromTime = (time) => {
     const hour = parseInt(time.split(':')[0]);
-    if (hour >= 5 && hour < 12) return 'morning';    // 5 AM - 11:59 AM
+    if (hour >= 0 && hour < 5) return 'midnight';     // 12 AM - 4:59 AM
+    if (hour >= 5 && hour < 12) return 'morning';     // 5 AM - 11:59 AM
     if (hour >= 12 && hour < 16) return 'afternoon';  // 12 PM - 3:59 PM  
     if (hour >= 16 && hour < 20) return 'evening';    // 4 PM - 7:59 PM
-    return 'night';                                   // 8 PM - 4:59 AM
+    return 'night';                                   // 8 PM - 11:59 PM
   };
 
   // Function to calculate alert time (1 minute before specific time)
@@ -1354,6 +1358,165 @@ const MedicineReminderApp = () => {
     return dosageHistory.filter(h =>
       new Date(h.takenAt).toDateString() === today
     );
+  };
+
+  // Get dosage history for a specific date
+  const getDosageHistoryForDate = (date) => {
+    const dateString = date.toDateString();
+    return dosageHistory.filter(h =>
+      new Date(h.takenAt).toDateString() === dateString
+    );
+  };
+
+  // Check if a medicine is scheduled for a given date based on frequency
+  const isMedicineScheduledForDate = (medicine, date) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const checkDate = new Date(date);
+    checkDate.setHours(0, 0, 0, 0);
+    
+    // Check if date is within reminder end date
+    if (medicine.reminderEndDate) {
+      const endDate = new Date(medicine.reminderEndDate);
+      endDate.setHours(23, 59, 59, 999);
+      if (checkDate > endDate) return false;
+    }
+    
+    // Check medicine creation date - don't show for dates before medicine was added
+    const createdDate = medicine.createdAt ? new Date(medicine.createdAt) : new Date(0);
+    createdDate.setHours(0, 0, 0, 0);
+    if (checkDate < createdDate) return false;
+    
+    const frequency = medicine.frequency || 'daily';
+    const dayOfWeek = checkDate.getDay(); // 0 = Sunday, 6 = Saturday
+    
+    switch (frequency) {
+      case 'daily':
+        return true;
+      
+      case 'every-other-day': {
+        // Calculate days difference from creation/reference date
+        const refDate = createdDate.getTime() > 0 ? createdDate : today;
+        const diffDays = Math.floor((checkDate - refDate) / (1000 * 60 * 60 * 24));
+        return diffDays % 2 === 0;
+      }
+      
+      case 'every-n-days': {
+        const nDays = medicine.frequencyDays || 2;
+        const refDate = createdDate.getTime() > 0 ? createdDate : today;
+        const diffDays = Math.floor((checkDate - refDate) / (1000 * 60 * 60 * 24));
+        return diffDays % nDays === 0;
+      }
+      
+      case 'specific-days': {
+        const specificDays = medicine.specificWeekDays || [];
+        return specificDays.includes(dayOfWeek);
+      }
+      
+      case 'weekly': {
+        // Check if same day of week as creation
+        const refDate = createdDate.getTime() > 0 ? createdDate : today;
+        return checkDate.getDay() === refDate.getDay();
+      }
+      
+      case 'monthly': {
+        // Check if same day of month as creation
+        const refDate = createdDate.getTime() > 0 ? createdDate : today;
+        return checkDate.getDate() === refDate.getDate();
+      }
+      
+      case 'as-needed':
+        return true; // Always show as-needed medicines
+      
+      default:
+        return true;
+    }
+  };
+
+  // Get medicines scheduled for a specific date and time slot
+  const getMedicinesForDateAndTime = (date, timeSlot) => {
+    return medicines.filter(med => {
+      if (med.time !== timeSlot) return false;
+      return isMedicineScheduledForDate(med, date);
+    });
+  };
+
+  // Check if selected date is today
+  const isToday = (date) => {
+    const today = new Date();
+    return date.toDateString() === today.toDateString();
+  };
+
+  // Check if selected date is in the past
+  const isPastDate = (date) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const checkDate = new Date(date);
+    checkDate.setHours(0, 0, 0, 0);
+    return checkDate < today;
+  };
+
+  // Check if selected date is in the future
+  const isFutureDate = (date) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const checkDate = new Date(date);
+    checkDate.setHours(0, 0, 0, 0);
+    return checkDate > today;
+  };
+
+  // Navigate to previous day
+  const goToPreviousDay = () => {
+    const newDate = new Date(selectedDate);
+    newDate.setDate(newDate.getDate() - 1);
+    setSelectedDate(newDate);
+  };
+
+  // Navigate to next day
+  const goToNextDay = () => {
+    const newDate = new Date(selectedDate);
+    newDate.setDate(newDate.getDate() + 1);
+    setSelectedDate(newDate);
+  };
+
+  // Navigate to today
+  const goToToday = () => {
+    setSelectedDate(new Date());
+  };
+
+  // Format date for display
+  const formatSelectedDate = (date) => {
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    if (date.toDateString() === today.toDateString()) {
+      return 'Today';
+    } else if (date.toDateString() === tomorrow.toDateString()) {
+      return 'Tomorrow';
+    } else if (date.toDateString() === yesterday.toDateString()) {
+      return 'Yesterday';
+    } else {
+      return date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    }
+  };
+
+  // Get medicine status for a date (taken, missed, or scheduled)
+  const getMedicineStatusForDate = (medicine, date) => {
+    const dateHistory = getDosageHistoryForDate(date);
+    const medicineHistory = dateHistory.filter(h => h.medicineId === medicine.id);
+    
+    if (medicineHistory.length > 0) {
+      return medicineHistory[0].status; // 'taken' or 'missed'
+    }
+    
+    if (isPastDate(date)) {
+      return 'missed'; // Past date with no history = missed
+    }
+    
+    return 'scheduled'; // Future or today
   };
 
   const getWeeklyStats = () => {
@@ -2957,10 +3120,11 @@ Try the diagnostic button below to see your current settings.`);
   const getCurrentTimeSlot = () => {
     const now = new Date();
     const hour = now.getHours();
+    if (hour >= 0 && hour < 5) return 'midnight';    // 12 AM - 4:59 AM
     if (hour >= 5 && hour < 12) return 'morning';    // 5 AM - 11:59 AM
     if (hour >= 12 && hour < 16) return 'afternoon'; // 12 PM - 3:59 PM
     if (hour >= 16 && hour < 20) return 'evening';   // 4 PM - 7:59 PM
-    return 'night';                                  // 8 PM - 4:59 AM
+    return 'night';                                  // 8 PM - 11:59 PM
   };
 
   // Auto-select the time-of-day tab based on current time on mount
@@ -2968,9 +3132,9 @@ Try the diagnostic button below to see your current settings.`);
     setActiveTab(getCurrentTimeSlot());
   }, []);
 
-  const MedicineCard = ({ medicine }) => (
+  const MedicineCard = ({ medicine, isReadOnly = false }) => (
     <div
-      className="bg-white rounded-xl shadow-sm border-l-4 p-4 mb-3"
+      className={`bg-white rounded-xl shadow-sm border-l-4 p-4 mb-3 ${isReadOnly ? 'opacity-80' : ''}`}
       style={{ borderLeftColor: medicine.color }}
     >
       <div className="flex items-start justify-between">
@@ -3012,52 +3176,54 @@ Try the diagnostic button below to see your current settings.`);
             )}
           </div>
         </div>
-        <div className="flex flex-col space-y-2">
-          <div className="flex space-x-2">
-            <button
-              onClick={() => editMedicine(medicine)}
-              className="p-2 bg-yellow-400 text-yellow-900 hover:bg-yellow-500 hover:text-yellow-950 rounded-lg transition-colors border border-yellow-500 shadow-md font-bold"
-              title="Edit"
-            >
-              <Edit2 className="w-4 h-4" />
-            </button>
-            <button
-              onClick={() => deleteMedicine(medicine.id)}
-              className="p-2 bg-red-500 text-white hover:bg-red-700 hover:text-white rounded-lg transition-colors border border-red-700 shadow-md font-bold"
-              title="Delete"
-            >
-              <Trash2 className="w-4 h-4" />
-            </button>
-            <button
-              onClick={async () => {
-                const result = await dismissActiveNotification(medicine.id, 'dismiss');
-                alert(result);
-              }}
-              className="p-2 bg-orange-500 text-white hover:bg-orange-600 rounded-lg transition-colors border border-orange-600 shadow-md font-bold"
-              title="Dismiss Active Alarms"
-            >
-              🔕
-            </button>
+        {!isReadOnly && (
+          <div className="flex flex-col space-y-2">
+            <div className="flex space-x-2">
+              <button
+                onClick={() => editMedicine(medicine)}
+                className="p-2 bg-yellow-400 text-yellow-900 hover:bg-yellow-500 hover:text-yellow-950 rounded-lg transition-colors border border-yellow-500 shadow-md font-bold"
+                title="Edit"
+              >
+                <Edit2 className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => deleteMedicine(medicine.id)}
+                className="p-2 bg-red-500 text-white hover:bg-red-700 hover:text-white rounded-lg transition-colors border border-red-700 shadow-md font-bold"
+                title="Delete"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+              <button
+                onClick={async () => {
+                  const result = await dismissActiveNotification(medicine.id, 'dismiss');
+                  alert(result);
+                }}
+                className="p-2 bg-orange-500 text-white hover:bg-orange-600 rounded-lg transition-colors border border-orange-600 shadow-md font-bold"
+                title="Dismiss Active Alarms"
+              >
+                🔕
+              </button>
+            </div>
+            <div className="flex space-x-2">
+              <button
+                onClick={() => addPills(medicine.id, 1)}
+                className="text-xs bg-green-500 text-white px-2 py-1 rounded border border-green-700 hover:bg-green-600 hover:text-white transition-colors shadow-md font-bold flex-1"
+                title="Add 1 pill to refill"
+              >
+                +1 💊
+              </button>
+              <button
+                onClick={async () => {
+                  await markMedicineAsTaken(medicine.id, false);
+                }}
+                className="text-xs bg-blue-500 text-white px-2 py-1 rounded border border-blue-700 hover:bg-blue-600 hover:text-white transition-colors shadow-md font-bold flex-1"
+                title="Mark as taken now"
+              >
+                ✅ Taken
+              </button>
+            </div>
           </div>
-          <div className="flex space-x-2">
-            <button
-              onClick={() => addPills(medicine.id, 1)}
-              className="text-xs bg-green-500 text-white px-2 py-1 rounded border border-green-700 hover:bg-green-600 hover:text-white transition-colors shadow-md font-bold flex-1"
-              title="Add 1 pill to refill"
-            >
-              +1 💊
-            </button>
-            <button
-              onClick={async () => {
-                await markMedicineAsTaken(medicine.id, false);
-              }}
-              className="text-xs bg-blue-500 text-white px-2 py-1 rounded border border-blue-700 hover:bg-blue-600 hover:text-white transition-colors shadow-md font-bold flex-1"
-              title="Mark as taken now"
-            >
-              ✅ Taken
-            </button>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -3602,7 +3768,8 @@ Try the diagnostic button below to see your current settings.`);
             morning: medicines.filter(m => m.time === 'morning'),
             afternoon: medicines.filter(m => m.time === 'afternoon'),
             evening: medicines.filter(m => m.time === 'evening'),
-            night: medicines.filter(m => m.time === 'night')
+            night: medicines.filter(m => m.time === 'night'),
+            midnight: medicines.filter(m => m.time === 'midnight')
           };
           
           let scheduleText = "📅 Today's complete schedule: ";
@@ -3619,6 +3786,9 @@ Try the diagnostic button below to see your current settings.`);
           }
           if (scheduleByTime.night.length > 0) {
             parts.push(`🌙 Night: ${scheduleByTime.night.map(m => `${m.name} at ${m.specificTime}`).join(', ')}`);
+          }
+          if (scheduleByTime.midnight.length > 0) {
+            parts.push(`🌌 Midnight: ${scheduleByTime.midnight.map(m => `${m.name} at ${m.specificTime}`).join(', ')}`);
           }
           
           response = scheduleText + parts.join('. ');
@@ -3807,20 +3977,15 @@ Try the diagnostic button below to see your current settings.`);
                   MyMedAlert
                 </h1>
                 <p className="text-xs text-gray-500">Smart Medicine Reminder</p>
-                <p className="text-[10px] text-gray-400 mt-0.5">
-                  {currentTime.toLocaleDateString('en-US', { weekday: 'short' })}, {currentTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} • {currentTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
-                </p>
               </div>
             </div>
 
-            {/* Emergency and Action Buttons */}
-            <div className="flex flex-col items-end space-y-1">
-              {/* Row 1: Emergency Buttons */}
-              <div className="flex items-center space-x-1.5">
+            {/* All Action Buttons in One Row */}
+            <div className="flex items-center space-x-1">
               {/* Emergency Button 1 - Phone */}
               <button
                 onClick={() => handleEmergencyCall(0, 'phone')}
-                className="bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white p-2 rounded-lg shadow-md transition-all"
+                className="bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white p-1.5 rounded-lg shadow-md transition-all"
                 title={emergencyContacts[0]?.name && emergencyContacts[0]?.phone
                   ? `Emergency Call: ${emergencyContacts[0].name} (${emergencyContacts[0].phone})`
                   : 'Emergency Contact 1'}
@@ -3834,7 +3999,7 @@ Try the diagnostic button below to see your current settings.`);
               {/* Emergency Button 2 - Phone */}
               <button
                 onClick={() => handleEmergencyCall(1, 'phone')}
-                className="bg-gradient-to-r from-orange-600 to-orange-700 hover:from-orange-700 hover:to-orange-800 text-white p-2 rounded-lg shadow-md transition-all"
+                className="bg-gradient-to-r from-orange-600 to-orange-700 hover:from-orange-700 hover:to-orange-800 text-white p-1.5 rounded-lg shadow-md transition-all"
                 title={emergencyContacts[1]?.name && emergencyContacts[1]?.phone
                   ? `Emergency Call: ${emergencyContacts[1].name} (${emergencyContacts[1].phone})`
                   : 'Emergency Contact 2'}
@@ -3848,21 +4013,18 @@ Try the diagnostic button below to see your current settings.`);
               {/* WhatsApp Emergency Button */}
               <button
                 onClick={() => handleEmergencyCall(0, 'whatsapp')}
-                className="bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white p-2 rounded-lg shadow-md transition-all"
+                className="bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white p-1.5 rounded-lg shadow-md transition-all"
                 title="WhatsApp Emergency"
               >
                 <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.890-5.335 11.893-11.893A11.821 11.821 0 0020.885 3.787" />
                 </svg>
               </button>
-              </div>
 
-              {/* Row 2: Share and Voice Assistant */}
-              <div className="flex items-center space-x-1.5">
               {/* Share Button */}
               <button
                 onClick={() => setShowSharingDialog(true)}
-                className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white p-2 rounded-lg shadow-md transition-all"
+                className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white p-1.5 rounded-lg shadow-md transition-all"
                 title="Share Medicine List"
               >
                 <Share2 className="w-3.5 h-3.5" />
@@ -3871,7 +4033,7 @@ Try the diagnostic button below to see your current settings.`);
               {/* Voice Assistant Button */}
               <button
                 onClick={startVoiceListening}
-                className={`p-2 rounded-lg shadow-md transition-all text-white ${voiceListening
+                className={`p-1.5 rounded-lg shadow-md transition-all text-white ${voiceListening
                   ? 'bg-gradient-to-r from-purple-600 to-purple-700 animate-pulse'
                   : 'bg-gradient-to-r from-indigo-600 to-indigo-700'
                 }`}
@@ -3879,7 +4041,6 @@ Try the diagnostic button below to see your current settings.`);
               >
                 {voiceListening ? <AudioWaveform className="w-3.5 h-3.5" /> : <BotMessageSquare className="w-3.5 h-3.5" />}
               </button>
-              </div>
             </div>
           </div>
         </div>
@@ -3942,13 +4103,69 @@ Try the diagnostic button below to see your current settings.`);
 
         {currentView === 'medicines' && (
           <div className="flex flex-col h-full">
+            {/* Date Selector Bar - Compact */}
+            <div className="bg-gradient-to-r from-blue-50 via-white to-purple-50 border-b border-gray-200 px-2 py-1.5">
+              <div className="flex items-center justify-between">
+                {/* Previous Day Button */}
+                <button
+                  onClick={goToPreviousDay}
+                  className="p-1.5 rounded-lg bg-white shadow-sm border border-gray-200 hover:bg-gray-50 active:scale-95 transition-all"
+                >
+                  <ChevronLeft className="w-4 h-4 text-gray-600" />
+                </button>
+
+                {/* Date Display - Clickable */}
+                <button
+                  onClick={() => setShowCalendar(true)}
+                  className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-white shadow-sm border border-gray-200 hover:bg-blue-50 active:scale-95 transition-all"
+                >
+                  <Calendar className="w-4 h-4 text-blue-600" />
+                  <span className="text-sm font-medium text-gray-800">
+                    {selectedDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
+                  </span>
+                  {!isToday(selectedDate) && (
+                    <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
+                      isPastDate(selectedDate) 
+                        ? 'bg-orange-100 text-orange-700' 
+                        : 'bg-green-100 text-green-700'
+                    }`}>
+                      {isPastDate(selectedDate) ? 'Past' : 'Upcoming'}
+                    </span>
+                  )}
+                </button>
+
+                {/* Next Day Button */}
+                <button
+                  onClick={goToNextDay}
+                  className="p-1.5 rounded-lg bg-white shadow-sm border border-gray-200 hover:bg-gray-50 active:scale-95 transition-all"
+                >
+                  <ChevronRight className="w-4 h-4 text-gray-600" />
+                </button>
+
+                {/* Today Button - Only when not on today */}
+                {!isToday(selectedDate) && (
+                  <button
+                    onClick={goToToday}
+                    className="text-[10px] px-2 py-1 bg-blue-600 text-white rounded-full hover:bg-blue-700 active:scale-95 transition-all shadow-sm ml-1"
+                  >
+                    Today
+                  </button>
+                )}
+              </div>
+            </div>
+
             {/* Time Tabs */}
             <div className="bg-white border-b flex-shrink-0">
               <div className="flex overflow-x-auto no-scrollbar">
                 {Object.entries(timeSlots).map(([key, slot]) => {
                   // Assign a unique gradient for each time slot
                   let activeGradient = '';
+                  let textColor = 'text-gray-900';
                   switch (key) {
+                    case 'midnight':
+                      activeGradient = 'bg-gradient-to-r from-indigo-900 via-purple-900 to-slate-900';
+                      textColor = 'text-white';
+                      break;
                     case 'morning':
                       activeGradient = 'bg-gradient-to-r from-blue-200 via-sky-300 to-blue-400';
                       break;
@@ -3960,6 +4177,7 @@ Try the diagnostic button below to see your current settings.`);
                       break;
                     case 'night':
                       activeGradient = 'bg-gradient-to-r from-gray-700 via-blue-900 to-indigo-900';
+                      textColor = 'text-white';
                       break;
                     default:
                       activeGradient = 'bg-gradient-to-r from-gray-100 via-gray-50 to-gray-200';
@@ -3968,16 +4186,16 @@ Try the diagnostic button below to see your current settings.`);
                     <button
                       key={key}
                       onClick={() => setActiveTab(key)}
-                      className={`flex-1 min-w-0 px-2 py-1.5 text-center border-b-2 transition-colors ${activeTab === key
-                        ? `border-fuchsia-500 ${activeGradient} text-gray-900 font-bold shadow-md`
+                      className={`flex-1 min-w-0 px-1.5 py-1 text-center border-b-2 transition-colors ${activeTab === key
+                        ? `border-fuchsia-500 ${activeGradient} ${textColor} font-bold shadow-md`
                         : 'border-transparent bg-gray-100 hover:bg-yellow-50 font-semibold text-gray-800'
                         }`}
                     >
-                      <div className="flex items-center justify-center gap-1">
-                        <span className={`text-sm ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.icon}</span>
-                        <span className={`text-xs font-medium ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.label}</span>
+                      <div className="flex items-center justify-center gap-0.5">
+                        <span className={`text-xs ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.icon}</span>
+                        <span className={`text-[10px] font-medium ${activeTab === key ? '' : 'text-gray-800'}`}>{slot.label}</span>
                       </div>
-                      <div className={`text-[10px] ${activeTab === key ? 'text-gray-600' : 'text-gray-500'}`}>{slot.time}</div>
+                      <div className={`text-[8px] ${activeTab === key ? (textColor === 'text-white' ? 'text-gray-300' : 'text-gray-600') : 'text-gray-500'}`}>{slot.time}</div>
                     </button>
                   );
                 })}
@@ -3986,55 +4204,103 @@ Try the diagnostic button below to see your current settings.`);
 
             {/* Medicine List */}
             <div className="p-4 sm:p-4 flex-1 min-h-0 overflow-y-auto scrollbar-hide">
-              {getMedicinesByTime(activeTab).length === 0 ? (
+              {getMedicinesForDateAndTime(selectedDate, activeTab).length === 0 ? (
                 <div className="flex flex-col items-center sm:items-start justify-center text-center sm:text-left py-12 px-2 sm:px-8 w-full">
                   <Clock className="w-12 h-12 text-gray-300 mb-4" />
                   <h3 className="text-lg font-medium text-gray-900 mb-2">
-                    No medicines for {timeSlots[activeTab].label.toLowerCase()}
+                    No medicines for {timeSlots[activeTab].label.toLowerCase()} {!isToday(selectedDate) && `on ${formatSelectedDate(selectedDate)}`}
                   </h3>
                   <p className="text-gray-500 mb-6">
-                    Add your first medicine for this time slot
+                    {isToday(selectedDate) 
+                      ? 'Add your first medicine for this time slot'
+                      : isPastDate(selectedDate)
+                        ? 'No medicines were scheduled for this time'
+                        : 'No medicines scheduled for this time'}
                   </p>
-                  <button
-                    onClick={() => openAddForm(activeTab)}
-                    className="group flex items-center space-x-2 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white px-6 py-3 rounded-xl shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
-                  >
-                    <Plus className="w-5 h-5 transition-transform group-hover:rotate-90 duration-200" />
-                    <span className="font-medium">Add Medicine</span>
-                  </button>
+                  {isToday(selectedDate) && (
+                    <button
+                      onClick={() => openAddForm(activeTab)}
+                      className="group flex items-center space-x-2 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white px-6 py-3 rounded-xl shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
+                    >
+                      <Plus className="w-5 h-5 transition-transform group-hover:rotate-90 duration-200" />
+                      <span className="font-medium">Add Medicine</span>
+                    </button>
+                  )}
                 </div>
               ) : (
                 <div>
                   <div className="flex items-center justify-between mb-4">
                     <h2 className="text-lg font-semibold text-gray-900">
-                      {timeSlots[activeTab].label} Medicines ({getMedicinesByTime(activeTab).length})
+                      {timeSlots[activeTab].label} Medicines ({getMedicinesForDateAndTime(selectedDate, activeTab).length})
+                      {isPastDate(selectedDate) && <span className="text-sm font-normal text-orange-600 ml-2">• History</span>}
+                      {isFutureDate(selectedDate) && <span className="text-sm font-normal text-green-600 ml-2">• Upcoming</span>}
                     </h2>
-                    <button
-                      onClick={() => openAddForm(activeTab)}
-                      className="group flex items-center space-x-2 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white px-4 py-2 rounded-lg shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
-                      title="Add Medicine"
-                    >
-                      <Plus className="w-4 h-4 transition-transform group-hover:rotate-90 duration-200" />
-                      <span className="text-sm font-medium">Add Medicine</span>
-                    </button>
+                    {isToday(selectedDate) && (
+                      <button
+                        onClick={() => openAddForm(activeTab)}
+                        className="group flex items-center space-x-2 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white px-4 py-2 rounded-lg shadow-lg hover:shadow-xl transition-all duration-200 transform hover:scale-105 active:scale-95"
+                        title="Add Medicine"
+                      >
+                        <Plus className="w-4 h-4 transition-transform group-hover:rotate-90 duration-200" />
+                        <span className="text-sm font-medium">Add Medicine</span>
+                      </button>
+                    )}
                   </div>
 
+                  {/* Past Date - Show History Summary */}
+                  {isPastDate(selectedDate) && (
+                    <div className="mb-4 p-3 bg-orange-50 border border-orange-200 rounded-lg">
+                      <div className="flex items-center space-x-2 text-orange-700 text-sm">
+                        <Calendar className="w-4 h-4" />
+                        <span className="font-medium">Viewing history for {formatSelectedDate(selectedDate)}</span>
+                      </div>
+                      <p className="text-xs text-orange-600 mt-1">
+                        ✅ = Taken | ❌ = Missed | ⏳ = No record
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Future Date - Info Banner */}
+                  {isFutureDate(selectedDate) && (
+                    <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+                      <div className="flex items-center space-x-2 text-green-700 text-sm">
+                        <Calendar className="w-4 h-4" />
+                        <span className="font-medium">Scheduled for {formatSelectedDate(selectedDate)}</span>
+                      </div>
+                      <p className="text-xs text-green-600 mt-1">
+                        These medicines are scheduled based on their frequency settings
+                      </p>
+                    </div>
+                  )}
+
                   {/* Patient Sections */}
-                  {Object.entries(getMedicinesByTimeAndPatient(activeTab)).map(([patientName, patientMedicines]) => {
-                    const isCollapsed = collapsedPatients.has(patientName);
-                    return (
-                      <div key={patientName} className="mb-6">
-                        {/* Patient Header */}
-                        <div
-                          className="flex items-center justify-between bg-gray-100 rounded-lg p-3 mb-3 cursor-pointer hover:bg-gray-200 transition-colors"
-                          onClick={() => togglePatientCollapse(patientName)}
-                        >
-                          <div className="flex items-center space-x-2">
-                            {isCollapsed ? (
-                              <ChevronRight className="w-5 h-5 text-gray-600" />
-                            ) : (
-                              <ChevronDown className="w-5 h-5 text-gray-600" />
-                            )}
+                  {(() => {
+                    // Group medicines by patient for the selected date
+                    const medsForDate = getMedicinesForDateAndTime(selectedDate, activeTab);
+                    const groupedByPatient = {};
+                    medsForDate.forEach(medicine => {
+                      const patientName = medicine.patientName || 'Unknown Patient';
+                      if (!groupedByPatient[patientName]) {
+                        groupedByPatient[patientName] = [];
+                      }
+                      groupedByPatient[patientName].push(medicine);
+                    });
+                    
+                    return Object.entries(groupedByPatient).map(([patientName, patientMedicines]) => {
+                      const isCollapsed = collapsedPatients.has(patientName);
+                      return (
+                        <div key={patientName} className="mb-6">
+                          {/* Patient Header */}
+                          <div
+                            className="flex items-center justify-between bg-gray-100 rounded-lg p-3 mb-3 cursor-pointer hover:bg-gray-200 transition-colors"
+                            onClick={() => togglePatientCollapse(patientName)}
+                          >
+                            <div className="flex items-center space-x-2">
+                              {isCollapsed ? (
+                                <ChevronRight className="w-5 h-5 text-gray-600" />
+                              ) : (
+                                <ChevronDown className="w-5 h-5 text-gray-600" />
+                              )}
                             <h3 className="text-md font-semibold text-gray-900">
                               {patientName}
                             </h3>
@@ -4047,14 +4313,36 @@ Try the diagnostic button below to see your current settings.`);
                         {/* Patient Medicines */}
                         {!isCollapsed && (
                           <div className="ml-4 space-y-3">
-                            {patientMedicines.map(medicine => (
-                              <MedicineCard key={medicine.id} medicine={medicine} />
-                            ))}
+                            {patientMedicines.map(medicine => {
+                              const status = getMedicineStatusForDate(medicine, selectedDate);
+                              return (
+                                <div key={medicine.id} className="relative">
+                                  {/* Status Badge for non-today dates */}
+                                  {!isToday(selectedDate) && (
+                                    <div className={`absolute -top-2 -right-2 z-10 px-2 py-0.5 rounded-full text-xs font-medium ${
+                                      status === 'taken' 
+                                        ? 'bg-green-100 text-green-700 border border-green-300' 
+                                        : status === 'missed'
+                                          ? 'bg-red-100 text-red-700 border border-red-300'
+                                          : 'bg-blue-100 text-blue-700 border border-blue-300'
+                                    }`}>
+                                      {status === 'taken' ? '✅ Taken' : status === 'missed' ? '❌ Missed' : '📋 Scheduled'}
+                                    </div>
+                                  )}
+                                  <MedicineCard 
+                                    key={medicine.id} 
+                                    medicine={medicine}
+                                    isReadOnly={!isToday(selectedDate)}
+                                  />
+                                </div>
+                              );
+                            })}
                           </div>
                         )}
                       </div>
                     );
-                  })}
+                  });
+                  })()}
                 </div>
               )}
             </div>
@@ -5258,6 +5546,160 @@ Click OK to continue.`;
                   <span>Copy</span>
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Calendar Date Picker Dialog */}
+      {showCalendar && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-4 shadow-2xl">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-semibold text-gray-900 flex items-center">
+                <Calendar className="w-5 h-5 mr-2 text-blue-600" />
+                Select Date
+              </h3>
+              <button
+                onClick={() => setShowCalendar(false)}
+                className="p-2 hover:bg-gray-100 rounded-full transition-colors"
+              >
+                <X className="w-5 h-5 text-gray-500" />
+              </button>
+            </div>
+
+            {/* Month/Year Navigation */}
+            <div className="flex items-center justify-between mb-4">
+              <button
+                onClick={() => {
+                  const newDate = new Date(selectedDate);
+                  newDate.setMonth(newDate.getMonth() - 1);
+                  setSelectedDate(newDate);
+                }}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <ChevronLeft className="w-5 h-5 text-gray-600" />
+              </button>
+              <span className="font-semibold text-gray-800">
+                {selectedDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+              </span>
+              <button
+                onClick={() => {
+                  const newDate = new Date(selectedDate);
+                  newDate.setMonth(newDate.getMonth() + 1);
+                  setSelectedDate(newDate);
+                }}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <ChevronRight className="w-5 h-5 text-gray-600" />
+              </button>
+            </div>
+
+            {/* Day Headers */}
+            <div className="grid grid-cols-7 gap-1 mb-2">
+              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
+                <div key={day} className="text-center text-xs font-medium text-gray-500 py-1">
+                  {day}
+                </div>
+              ))}
+            </div>
+
+            {/* Calendar Days */}
+            <div className="grid grid-cols-7 gap-1">
+              {(() => {
+                const year = selectedDate.getFullYear();
+                const month = selectedDate.getMonth();
+                const firstDay = new Date(year, month, 1);
+                const lastDay = new Date(year, month + 1, 0);
+                const daysInMonth = lastDay.getDate();
+                const startDayOfWeek = firstDay.getDay();
+                
+                const days = [];
+                
+                // Empty cells for days before month starts
+                for (let i = 0; i < startDayOfWeek; i++) {
+                  days.push(<div key={`empty-${i}`} className="h-10" />);
+                }
+                
+                // Days of the month
+                const today = new Date();
+                for (let day = 1; day <= daysInMonth; day++) {
+                  const date = new Date(year, month, day);
+                  const isCurrentDay = date.toDateString() === today.toDateString();
+                  const isSelected = date.toDateString() === selectedDate.toDateString();
+                  const isPast = date < new Date(today.setHours(0, 0, 0, 0));
+                  
+                  // Check if there are medicines scheduled for this day
+                  const hasMedicines = medicines.some(med => isMedicineScheduledForDate(med, date));
+                  
+                  // Check dosage history for this day
+                  const dayHistory = getDosageHistoryForDate(date);
+                  const hasTaken = dayHistory.some(h => h.status === 'taken');
+                  const hasMissed = isPast && hasMedicines && dayHistory.length === 0;
+                  
+                  days.push(
+                    <button
+                      key={day}
+                      onClick={() => {
+                        setSelectedDate(date);
+                        setShowCalendar(false);
+                      }}
+                      className={`h-10 rounded-lg text-sm font-medium transition-all relative ${
+                        isSelected
+                          ? 'bg-blue-600 text-white shadow-md'
+                          : isCurrentDay
+                            ? 'bg-blue-100 text-blue-700 border-2 border-blue-400'
+                            : 'hover:bg-gray-100 text-gray-700'
+                      }`}
+                    >
+                      {day}
+                      {/* Status Indicators */}
+                      {!isSelected && hasMedicines && (
+                        <span className={`absolute bottom-1 left-1/2 transform -translate-x-1/2 w-1.5 h-1.5 rounded-full ${
+                          hasTaken ? 'bg-green-500' : hasMissed ? 'bg-red-500' : 'bg-blue-400'
+                        }`} />
+                      )}
+                    </button>
+                  );
+                }
+                
+                return days;
+              })()}
+            </div>
+
+            {/* Legend */}
+            <div className="flex justify-center space-x-4 mt-4 pt-3 border-t">
+              <div className="flex items-center text-xs text-gray-600">
+                <span className="w-2 h-2 rounded-full bg-green-500 mr-1" />
+                Taken
+              </div>
+              <div className="flex items-center text-xs text-gray-600">
+                <span className="w-2 h-2 rounded-full bg-red-500 mr-1" />
+                Missed
+              </div>
+              <div className="flex items-center text-xs text-gray-600">
+                <span className="w-2 h-2 rounded-full bg-blue-400 mr-1" />
+                Scheduled
+              </div>
+            </div>
+
+            {/* Quick Actions */}
+            <div className="flex space-x-2 mt-4">
+              <button
+                onClick={() => {
+                  setSelectedDate(new Date());
+                  setShowCalendar(false);
+                }}
+                className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
+              >
+                Go to Today
+              </button>
+              <button
+                onClick={() => setShowCalendar(false)}
+                className="flex-1 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-300 transition-colors"
+              >
+                Cancel
+              </button>
             </div>
           </div>
         </div>
