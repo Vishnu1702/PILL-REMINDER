@@ -38,6 +38,7 @@ const MedicineReminderApp = () => {
   const [selectedDate, setSelectedDate] = useState(new Date()); // For calendar date picker
   const [showCalendar, setShowCalendar] = useState(false); // Show/hide calendar popup
   const [shareSelection, setShareSelection] = useState({}); // for selecting medicines to share
+  const [isBatteryBypassed, setIsBatteryBypassed] = useState(false); // check if battery optimization is bypassed
   const [formData, setFormData] = useState({
     patientName: '', // new field
     doctorName: '', // optional doctor name field
@@ -146,6 +147,22 @@ const MedicineReminderApp = () => {
       setCurrentTime(new Date());
     }, 60000);
     return () => clearInterval(timer);
+  }, []);
+
+  // Check battery optimization status on mount
+  useEffect(() => {
+    const checkBatteryStatus = async () => {
+      try {
+        if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.MedicineAlarm) {
+          const res = await window.Capacitor.Plugins.MedicineAlarm.isBatteryOptimizationIgnored();
+          setIsBatteryBypassed(res.isIgnored);
+          console.log('🔋 Battery optimization ignored:', res.isIgnored);
+        }
+      } catch (err) {
+        console.error('❌ Failed to check battery optimization status:', err);
+      }
+    };
+    checkBatteryStatus();
   }, []);
 
   // Request notification permissions and create channels on mount
@@ -612,7 +629,7 @@ const MedicineReminderApp = () => {
       // Cancel any existing notifications for this medicine first
       try {
         const notificationIds = [];
-        for (let day = 0; day < 7; day++) {
+        for (let day = 0; day < 30; day++) {
           notificationIds.push({ id: generateNotificationId(medicine.id, day) });
         }
         await LocalNotifications.cancel({
@@ -635,7 +652,7 @@ const MedicineReminderApp = () => {
           currentTime: new Date().toString()
         });
         try {
-          const results = await scheduleNativeAlarm(medicine);
+          const results = await scheduleNativeAlarm(medicine, 30);
           console.log('✅ Native alarm scheduled successfully - skipping Capacitor notifications');
           console.log('📊 Scheduling results:', results);
           return; // Exit early for native alarms
@@ -648,8 +665,8 @@ const MedicineReminderApp = () => {
 
       const notifications = [];
 
-      // Schedule notifications for the next 7 days to ensure persistence
-      for (let day = 0; day < 7; day++) {
+      // Schedule notifications for the next 30 days to ensure persistence
+      for (let day = 0; day < 30; day++) {
         const now = new Date();
         const notifTime = new Date(now);
         notifTime.setDate(notifTime.getDate() + day);
@@ -1068,7 +1085,7 @@ const MedicineReminderApp = () => {
     try {
       // Cancel all notifications for this medicine (current and future days)
       const notificationIds = [];
-      for (let day = 0; day < 7; day++) {
+      for (let day = 0; day < 30; day++) {
         notificationIds.push({ id: generateNotificationId(id, day) });
       }
       await LocalNotifications.cancel({ notifications: notificationIds });
@@ -1650,7 +1667,7 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
   };
 
   // NEW: Native Medicine Alarm functions using our custom plugin
-  const scheduleNativeAlarm = async (medicine, scheduleForDays = 7) => {
+  const scheduleNativeAlarm = async (medicine, scheduleForDays = 30) => {
     try {
       if (window.Capacitor && window.Capacitor.isNativePlatform()) {
         console.log('🚨 Scheduling NATIVE alarms for:', medicine.name, `(${scheduleForDays} days)`);
@@ -1797,8 +1814,8 @@ For Android 12+, ensure "Alarms & reminders" permission is enabled in app settin
         }
 
         const results = [];
-        // Cancel alarms for the next 7 days (matching the scheduling logic)
-        for (let day = 0; day < 7; day++) {
+        // Cancel alarms for the next 30 days (matching the scheduling logic)
+        for (let day = 0; day < 30; day++) {
           const alarmId = generateNotificationId(medicineId, day);
 
           try {
@@ -4572,12 +4589,14 @@ Try the diagnostic button below to see your current settings.`);
                   <AlertTriangle className="w-5 h-5 mr-2 text-red-600" />
                   🔋 CRITICAL: Battery Optimization Settings
                 </h2>
-                <div className="bg-red-50 p-3 rounded-lg mb-3">
-                  <p className="text-sm text-red-800 font-semibold mb-2">
-                    ⚠️ ALARMS WON'T WORK WHEN APP IS CLOSED WITHOUT THIS!
+                <div className={`p-3 rounded-lg mb-3 ${isBatteryBypassed ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'}`}>
+                  <p className="text-sm font-semibold mb-2 flex items-center">
+                    {isBatteryBypassed ? '✅ BATTERY SAVER IS BYPASSED' : '⚠️ ALARMS WON\'T WORK WHEN APP IS CLOSED WITHOUT THIS!'}
                   </p>
-                  <p className="text-xs text-red-700">
-                    Android kills apps in the background to save battery. You MUST disable battery optimization for alarms to work when app is closed and phone is locked.
+                  <p className="text-xs">
+                    {isBatteryBypassed 
+                      ? 'Congratulations! The app has unrestricted battery access and reminders will trigger reliably.' 
+                      : 'Android kills apps in the background to save battery. You MUST disable battery optimization for alarms to work when app is closed and phone is locked.'}
                   </p>
                 </div>
                 <div className="space-y-2">
@@ -4585,39 +4604,44 @@ Try the diagnostic button below to see your current settings.`);
                     onClick={async () => {
                       try {
                         if (!window.Capacitor || !window.Capacitor.isNativePlatform()) {
-                          alert('This feature is only available on Android devices.');
+                          alert("This feature is only available on Android devices.");
                           return;
                         }
 
-                        const instructions = `🔋 DISABLE BATTERY OPTIMIZATION - CRITICAL!
-
-⚠️ WHY THIS IS NEEDED:
-Your alarms are NOT working when the app is closed because Android is killing the app to save battery. This is the #1 reason alarms don't fire!
-
-📱 FOLLOW THESE STEPS:
-
-1. Click OK to continue
-2. Go to: Settings → Apps → MyMedAlert
-3. Tap "Battery" or "Battery usage"
-4. Select "Unrestricted" or "Don't optimize"
-5. Restart your phone
-6. Test alarm with app closed
-
-FOR XIAOMI/HUAWEI/ONEPLUS:
-Also enable "Autostart" in app permissions!
-
-Click OK to continue.`;
-
-                        alert(instructions);
-
+                        if (window.Capacitor.Plugins && window.Capacitor.Plugins.MedicineAlarm) {
+                          const res = await window.Capacitor.Plugins.MedicineAlarm.isBatteryOptimizationIgnored();
+                          if (res.isIgnored) {
+                            alert("ðŸ”‹ Battery Optimization is ALREADY exempted/unrestricted. You are good to go!");
+                            setIsBatteryBypassed(true);
+                            return;
+                          }
+                          
+                          // Inform user, then trigger native exemption request
+                          const instructions = `ðŸ”‹ REQUESTING BATTERY EXEMPTION
+                          
+An official Android system prompt will appear next. Please choose "ALLOW" to ensure MyMedAlert can launch fullscreen alarms on time when the device is locked/idle.`;
+                          alert(instructions);
+                          
+                          await window.Capacitor.Plugins.MedicineAlarm.requestIgnoreBatteryOptimizations();
+                          
+                          // Recheck status after 3 seconds
+                          setTimeout(async () => {
+                            const recheck = await window.Capacitor.Plugins.MedicineAlarm.isBatteryOptimizationIgnored();
+                            setIsBatteryBypassed(recheck.isIgnored);
+                          }, 3000);
+                        }
                       } catch (error) {
-                        console.error('❌ Error:', error);
-                        alert('Please manually disable battery optimization:\\nSettings → Apps → MyMedAlert → Battery → Unrestricted');
+                        console.error("âŒ Error requesting battery optimization exemption:", error);
+                        alert("Please manually disable battery optimization:\nSettings -> Apps -> MyMedAlert -> Battery -> Unrestricted");
                       }
                     }}
-                    className="w-full p-4 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-bold border-4 border-red-800 shadow-lg text-center"
+                    className={`w-full p-4 text-white rounded-lg transition-colors font-bold border-4 shadow-lg text-center ${
+                      isBatteryBypassed 
+                        ? "bg-green-600 hover:bg-green-700 border-green-800" 
+                        : "bg-red-600 hover:bg-red-700 border-red-800 animate-bounce"
+                    }`}
                   >
-                    ⚡🔋 DISABLE BATTERY OPTIMIZATION (REQUIRED!)
+                    {isBatteryBypassed ? "âœ… BATTERY SAVER IS BYPASSED" : "âš¡ðŸ”‹ DISABLE BATTERY OPTIMIZATION (REQUIRED!)"}
                   </button>
                   <button
                     onClick={async () => {
