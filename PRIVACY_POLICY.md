@@ -72,7 +72,7 @@ You have the right to:
 ## Contact Us
 
 If you have questions about this Privacy Policy, please contact us at:
-- Email: [your-email@example.com]
+- Email: balivishnu.cs@gmail.com
 - GitHub: https://github.com/Vishnu1702/PILL-REMINDER
 
 ## Consent
